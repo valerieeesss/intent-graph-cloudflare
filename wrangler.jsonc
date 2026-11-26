@@ -1,0 +1,21 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "intent-graph",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-26",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*"]
+  },
+  "vars": {
+    "GOOGLE_CLOUD_PROJECT": "entity-detector-510013",
+    "GOOGLE_CLOUD_LOCATION": "us-central1",
+    "VERTEX_EMBEDDING_MODEL": "gemini-embedding-001",
+    "ANTHROPIC_MODEL": "claude-sonnet-4-6",
+    "GOOGLE_OAUTH_CLIENT_ID": ""
+  },
+  "secrets": {
+    "required": ["APP_PASSWORD", "SEOGETS_API_KEY"]
+  }
+}

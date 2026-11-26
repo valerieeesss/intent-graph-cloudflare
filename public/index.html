@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f6f8"><title>Page overlap graph</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="/"><span class="brand-mark">↗</span> pagegraph</a><span class="top-note">CONTENT OVERLAP ANALYSIS</span></header>
+  <main class="shell">
+    <section class="intro">
+      <div class="eyebrow">A clearer view of your content</div>
+      <h1>Find where your pages<br><span>overlap in purpose.</span></h1>
+      <p class="lede">Compare live pages using their actual content. See what matches, what each page is for, and where their roles may be unclear.</p>
+    </section>
+
+    <section class="workspace" aria-label="Start a page analysis">
+      <div class="step-head"><div><span class="step-number">01</span><h2>Add pages</h2></div><span class="small-note">2–100 URLs per analysis</span></div>
+      <div class="input-grid">
+        <div class="input-panel">
+          <label class="field-label" for="url-list">Paste URLs <span>one per line</span></label>
+          <textarea id="url-list" placeholder="https://example.com/business-loans/&#10;https://example.com/business-loans/guide/&#10;https://example.com/business-loans/apply/" spellcheck="false"></textarea>
+          <div class="under-field"><span id="url-count">0 URLs</span><button class="text-button" type="button" id="clear-urls">Clear</button></div>
+        </div>
+        <div class="or"><span>OR</span></div>
+        <label class="upload-panel" for="csv-file" id="dropzone">
+          <input id="csv-file" type="file" accept=".csv,text/csv">
+          <span class="upload-icon">↑</span><strong>Upload a CSV</strong><span>Drop a file here or <u>browse files</u></span>
+          <span class="file-name" id="file-name">Use a <code>url</code> column. Role is inferred from each URL slug.</span>
+        </label>
+      </div>
+
+      <div class="options-row">
+      <div class="threshold-control"><label for="threshold">Show matches from <strong><span id="threshold-value">85</span>%</strong></label><input id="threshold" type="range" min="10" max="90" value="85"><div class="range-labels"><span>More connections</span><span>Stronger matches</span></div></div>
+        <button id="analyze" class="primary-button" type="button"><span>Build my graph</span><span class="button-arrow">→</span></button>
+      </div>
+      <p class="privacy-note">Pages are fetched for analysis. Claude reads the extracted page text and URL slug. Google Cloud can add embeddings and closest-entity salience when connected.</p>
+    </section>
+
+    <section class="workspace evidence-workspace" aria-label="Optional search performance evidence">
+      <div class="step-head"><div><span class="step-number">02</span><h2>Validate with SEO Gets</h2></div><span class="small-note">Optional · read-only Search Console data</span></div>
+      <p class="evidence-intro">See whether multiple pages receive impressions for the same Google searches. SEO Gets supplies Search Console performance data; this app shows the query overlap separately from content similarity.</p>
+      <div class="evidence-controls">
+        <label class="field-label" for="seogets-site">SEO Gets property <span>enter its exact site name</span></label>
+        <div class="site-row"><input id="seogets-site" list="seogets-sites" placeholder="e.g. westpac.com.au"><datalist id="seogets-sites"></datalist><button id="check-seogets" class="secondary-button" type="button">Check connection</button></div>
+        <div class="date-row"><label class="field-label" for="start-date">From <input id="start-date" type="date"></label><label class="field-label" for="end-date">To <input id="end-date" type="date"></label></div>
+        <div id="seogets-status" class="connection-status" aria-live="polite">SEO Gets evidence is optional. Its API key stays on the server.</div>
+      </div>
+      <div class="cloud-auth-row"><div><strong>Google Cloud analysis</strong><p>Optional connection for Vertex AI embeddings and Google entity salience.</p></div><button id="connect-cloud" class="secondary-button" type="button">Connect Google Cloud</button></div>
+      <div id="cloud-status" class="connection-status" aria-live="polite">Not connected; content similarity will use local TF-IDF.</div>
+    </section>
+
+    <section class="progress-card hidden" id="progress-card" aria-live="polite">
+      <div class="progress-top"><div><div class="eyebrow">ANALYSIS IN PROGRESS</div><h2 id="progress-title">Getting things ready…</h2></div><span class="progress-percent" id="progress-percent">0%</span></div>
+      <div class="progress-track"><div id="progress-fill"></div></div><div class="progress-bottom"><span id="progress-phase">Waiting to start</span><span id="progress-pages"></span></div>
+    </section>
+
+    <section class="result-card hidden" id="result-card">
+      <div class="result-head"><div><div class="eyebrow">YOUR ANALYSIS</div><h2>Graph is ready</h2></div><a id="download-link" download class="primary-button download-button" href="#"><span>Download HTML</span><span class="button-arrow">↓</span></a></div>
+      <div class="result-stats" id="result-stats"></div>
+      <div class="result-method" id="result-method"></div>
+      <div class="error-list hidden" id="error-list"></div>
+      <div class="graph-frame"><iframe id="graph-frame" title="Interactive content overlap graph"></iframe></div>
+      <button class="text-button new-analysis" id="new-analysis" type="button">← Start another analysis</button>
+    </section>
+
+    <section class="how-grid"><article><span>01 / READ</span><h3>Pages, not URL guesses</h3><p>The app extracts readable text from each page before comparing anything.</p></article><article><span>02 / COMPARE</span><h3>Cleaned similarity with evidence</h3><p>Repeated navigation, footer, and same-site template text is filtered before matching and evidence selection.</p></article><article><span>03 / UNDERSTAND</span><h3>Intent in context</h3><p>Claude infers expected role from the URL slug, then checks current intent and role depth against the fetched page text.</p></article></section>
+    <footer><span>PAGEGRAPH · EARLY ACCESS</span><span>Analysis is a signal for review, not an automatic content decision.</span></footer>
+  </main>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script src="/app.js"></script>
+</body>
+</html>
