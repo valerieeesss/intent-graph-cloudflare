@@ -39,19 +39,6 @@
       <p class="privacy-note">Pages are fetched for analysis. Claude reads the extracted page text and URL slug. Google Cloud analysis and SEO Gets verification run automatically when configured.</p>
     </section>
 
-    <section class="workspace evidence-workspace" aria-label="Search performance verification">
-      <div class="step-head"><div><span class="step-number">02</span><h2>Search verification</h2></div><span class="small-note">Automatic · read-only Search Console data</span></div>
-      <p class="evidence-intro">See whether multiple pages receive impressions for the same Google searches. SEO Gets supplies Search Console performance data; this app shows the query overlap separately from content similarity.</p>
-      <div class="evidence-controls">
-        <label class="field-label" for="seogets-site">SEO Gets property <span>auto-matched from the pasted URLs</span></label>
-        <div class="site-row"><input id="seogets-site" list="seogets-sites" placeholder="Auto-matched when URL list is entered"><datalist id="seogets-sites"></datalist><button id="check-seogets" class="secondary-button" type="button">Refresh properties</button></div>
-        <div class="date-row"><label class="field-label" for="start-date">From <input id="start-date" type="date"></label><label class="field-label" for="end-date">To <input id="end-date" type="date"></label></div>
-        <div id="seogets-status" class="connection-status" aria-live="polite">Loading SEO Gets properties for automatic verification…</div>
-      </div>
-      <div class="cloud-auth-row"><div><strong>Google Cloud analysis</strong><p>Runs automatically through the app’s server-side Google service account.</p></div></div>
-      <div id="cloud-status" class="connection-status" aria-live="polite">Checking Google Cloud configuration…</div>
-    </section>
-
     <section class="progress-card hidden" id="progress-card" aria-live="polite">
       <div class="progress-top"><div><div class="eyebrow">ANALYSIS IN PROGRESS</div><h2 id="progress-title">Getting things ready…</h2></div><span class="progress-percent" id="progress-percent">0%</span></div>
       <div class="progress-track"><div id="progress-fill"></div></div><div class="progress-bottom"><span id="progress-phase">Waiting to start</span><span id="progress-pages"></span></div>

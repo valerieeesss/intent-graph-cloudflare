@@ -1,8 +1,7 @@
 const $=s=>document.querySelector(s);
 const urlList=$('#url-list'),csvFile=$('#csv-file'),analyzeButton=$('#analyze');
-let reportBlob=null,seogetsChoices=[],autoSeoSite='',seoSitesPromise=Promise.resolve();
+let reportBlob=null,seogetsChoices=[],seoSitesPromise=Promise.resolve(),seoSitesError='';
 
-function setStatus(id,message,kind=''){const el=$(id);el.textContent=message;el.className=`connection-status ${kind}`.trim()}
 async function api(path,body){
   const options={method:body===undefined?'GET':'POST',headers:{}};
   if(body!==undefined){options.headers['content-type']='application/json';options.body=JSON.stringify(body)}
@@ -12,11 +11,9 @@ async function api(path,body){
 }
 
 function localDate(d){return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
-function setDefaultDates(){const end=new Date(),start=new Date();start.setDate(start.getDate()-90);$('#start-date').value=localDate(start);$('#end-date').value=localDate(end)}
-setDefaultDates();
 
 function countUrls(){const count=urlList.value.split(/\r?\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#')).length;$('#url-count').textContent=`${count} URL${count===1?'':'s'}`}
-urlList.addEventListener('input',()=>{countUrls();autoSelectSeoSite()});$('#clear-urls').addEventListener('click',()=>{urlList.value='';countUrls();autoSelectSeoSite()});
+urlList.addEventListener('input',countUrls);$('#clear-urls').addEventListener('click',()=>{urlList.value='';countUrls()});
 $('#threshold').addEventListener('input',e=>$('#threshold-value').textContent=e.target.value);
 csvFile.addEventListener('change',()=>{$('#file-name').textContent=csvFile.files[0]?.name||'Use a url column. Role is inferred from each URL slug.'});
 const dropzone=$('#dropzone');
@@ -28,14 +25,9 @@ function parseCsv(text){const rows=[];let row=[],cell='',quoted=false;for(let i=
 
 function candidates(value,out=[]){if(typeof value==='string'){const s=value.trim();const matches=[...s.matchAll(/(?:https?:\/\/[^\s|,]+|sc-domain:[^\s|,]+)/g)].map(m=>m[0].replace(/[),.;]+$/,''));if(matches.length)out.push(...matches);else if(/^[a-z0-9.-]+\.[a-z]{2,}(?:\/[^\s|,]*)?$/i.test(s))out.push(s);return out}if(Array.isArray(value)){for(const v of value)candidates(v,out);return out}if(value&&typeof value==='object'){for(const[k,v]of Object.entries(value)){if(typeof v==='string'&&/(site|domain|property|name)/i.test(k)){const s=v.trim();if(s&&s.length<220)candidates(s,out)}else candidates(v,out)}}return out}
 function propertyHost(value){const s=String(value||'').trim().toLowerCase();if(s.startsWith('sc-domain:'))return s.slice(10).replace(/^www\./,'');try{return new URL(s.includes('://')?s:`https://${s}`).hostname.replace(/^www\./,'')}catch{return ''}}
-function autoSelectSeoSite(urls=urlList.value.split(/\r?\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#'))){const input=$('#seogets-site');if(input.value&&input.value!==autoSeoSite)return;input.value='';autoSeoSite='';const hosts=urls.map(x=>{try{return new URL(x).hostname.toLowerCase().replace(/^www\./,'')}catch{return ''}}).filter(Boolean);if(!hosts.length||!seogetsChoices.length)return;const site=seogetsChoices.find(choice=>{const domain=propertyHost(choice);return domain&&hosts.every(host=>host===domain||host.endsWith(`.${domain}`))});if(site){input.value=site;autoSeoSite=site;setStatus('#seogets-status',`Verification will use ${site} for the submitted URLs.`,'success')}}
-async function loadSeoSites(){const button=$('#check-seogets');if(button)button.disabled=true;setStatus('#seogets-status','Loading SEO Gets properties…');try{const data=await api('/api/seogets/sites',{});seogetsChoices=[...new Set(candidates(data.sites))];$('#seogets-sites').replaceChildren(...seogetsChoices.map(x=>{const o=document.createElement('option');o.value=x;return o}));if(!seogetsChoices.length)throw new Error('Connected to SEO Gets, but no site properties were returned.');autoSelectSeoSite();if(!$('#seogets-site').value)setStatus('#seogets-status',`${seogetsChoices.length} properties found. Enter the URL list to auto-select its matching property, or choose one.`,'success')}catch(e){setStatus('#seogets-status',e.message,'error')}finally{if(button)button.disabled=false}}
-$('#seogets-site').addEventListener('input',()=>{if($('#seogets-site').value!==autoSeoSite)autoSeoSite=''});
-$('#check-seogets').addEventListener('click',()=>{seoSitesPromise=loadSeoSites()});
+function autoSelectSeoSite(urls){const hosts=urls.map(x=>{try{return new URL(x).hostname.toLowerCase().replace(/^www\./,'')}catch{return ''}}).filter(Boolean);if(!hosts.length||!seogetsChoices.length)return '';return seogetsChoices.find(choice=>{const domain=propertyHost(choice);return domain&&hosts.every(host=>host===domain||host.endsWith(`.${domain}`))})||''}
+async function loadSeoSites(){try{const data=await api('/api/seogets/sites',{});seogetsChoices=[...new Set(candidates(data.sites))];if(!seogetsChoices.length)throw new Error('SEO Gets did not return any Search Console properties.')}catch(e){seoSitesError=e.message}}
 seoSitesPromise=loadSeoSites();
-
-async function showGoogleStatus(){try{const cfg=await api('/api/config');setStatus('#cloud-status',cfg.google_cloud_configured?`Google Cloud analysis is enabled by default for project ${cfg.google_cloud_project}.`:'Google Cloud service account is not set in Cloudflare yet; add it before running an analysis.',cfg.google_cloud_configured?'success':'') }catch(e){setStatus('#cloud-status',e.message,'error')}}
-showGoogleStatus();
 
 function showError(message){const el=$('#progress-card');el.classList.remove('hidden');$('#progress-title').textContent='Could not complete the analysis';$('#progress-phase').textContent=message;$('#progress-percent').textContent='';$('#progress-fill').style.width='0%';analyzeButton.disabled=false}
 async function beginAnalysis(){
@@ -43,8 +35,9 @@ async function beginAnalysis(){
   const urls=urlList.value.split(/\r?\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#'));
   if(csvFile.files[0])try{urls.push(...parseCsv(await csvFile.files[0].text()))}catch{showError('Could not read the CSV file.');return}
   $('#progress-card').classList.remove('hidden');$('#result-card').classList.add('hidden');$('#progress-title').textContent='Reading and comparing your pages…';$('#progress-phase').textContent=`Submitting ${urls.length} URLs`;$('#progress-percent').textContent='0%';$('#progress-fill').style.width='0%';analyzeButton.disabled=true;
-  await seoSitesPromise;autoSelectSeoSite(urls);const site=$('#seogets-site').value.trim();if(!site){showError('Could not match these URLs to an SEO Gets property. Choose the matching property before running verification.');return}
-  try{const data=await api('/api/analyze',{urls,threshold:Number($('#threshold').value),seogets_site:site,start_date:$('#start-date').value,end_date:$('#end-date').value});$('#progress-percent').textContent='100%';$('#progress-fill').style.width='100%';$('#progress-phase').textContent='Report ready';await showResult(data.result)}catch(e){showError(e.message)}
+  await seoSitesPromise;const site=autoSelectSeoSite(urls);if(!site){showError(seoSitesError||'Could not automatically match these URLs to an SEO Gets property. Check that they belong to a property in the connected SEO Gets account.');return}
+  const end=new Date(),start=new Date();start.setDate(start.getDate()-90);
+  try{const data=await api('/api/analyze',{urls,threshold:Number($('#threshold').value),seogets_site:site,start_date:localDate(start),end_date:localDate(end)});$('#progress-percent').textContent='100%';$('#progress-fill').style.width='100%';$('#progress-phase').textContent='Report ready';await showResult(data.result)}catch(e){showError(e.message)}
 }
 
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
