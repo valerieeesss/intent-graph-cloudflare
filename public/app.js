@@ -1,6 +1,6 @@
 const $=s=>document.querySelector(s);
 const urlList=$('#url-list'),csvFile=$('#csv-file'),analyzeButton=$('#analyze');
-let cloudToken='',reportBlob=null;
+let reportBlob=null,seogetsChoices=[],autoSeoSite='',seoSitesPromise=Promise.resolve();
 
 function setStatus(id,message,kind=''){const el=$(id);el.textContent=message;el.className=`connection-status ${kind}`.trim()}
 async function api(path,body){
@@ -16,7 +16,7 @@ function setDefaultDates(){const end=new Date(),start=new Date();start.setDate(s
 setDefaultDates();
 
 function countUrls(){const count=urlList.value.split(/\r?\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#')).length;$('#url-count').textContent=`${count} URL${count===1?'':'s'}`}
-urlList.addEventListener('input',countUrls);$('#clear-urls').addEventListener('click',()=>{urlList.value='';countUrls()});
+urlList.addEventListener('input',()=>{countUrls();autoSelectSeoSite()});$('#clear-urls').addEventListener('click',()=>{urlList.value='';countUrls();autoSelectSeoSite()});
 $('#threshold').addEventListener('input',e=>$('#threshold-value').textContent=e.target.value);
 csvFile.addEventListener('change',()=>{$('#file-name').textContent=csvFile.files[0]?.name||'Use a url column. Role is inferred from each URL slug.'});
 const dropzone=$('#dropzone');
@@ -26,12 +26,16 @@ dropzone.addEventListener('drop',e=>{const f=e.dataTransfer.files[0];if(f){const
 
 function parseCsv(text){const rows=[];let row=[],cell='',quoted=false;for(let i=0;i<text.length;i++){const c=text[i];if(quoted){if(c==='"'&&text[i+1]==='"'){cell+='"';i++}else if(c==='"')quoted=false;else cell+=c}else if(c==='"')quoted=true;else if(c===','){row.push(cell);cell=''}else if(c==='\n'){row.push(cell);rows.push(row);row=[];cell=''}else if(c!=='\r')cell+=c}if(cell||row.length){row.push(cell);rows.push(row)}if(!rows.length)return[];const first=rows[0].map(x=>x.trim().toLowerCase().replace(/ /g,'_'));const col=first.findIndex(x=>['url','urls','address'].includes(x));const data=col>=0?rows.slice(1):rows;return data.map(r=>r[col>=0?col:0]?.trim()).filter(x=>x&&!x.startsWith('#'))}
 
-function candidates(value,out=[]){if(typeof value==='string'){for(const match of value.matchAll(/(?:https?:\/\/[^\s|,]+|sc-domain:[^\s|,]+)/g))out.push(match[0].replace(/[),.;]+$/,''));return out}if(Array.isArray(value)){for(const v of value)candidates(v,out);return out}if(value&&typeof value==='object'){for(const[k,v]of Object.entries(value)){if(typeof v==='string'&&/(site|domain|property|name)/i.test(k)){const s=v.trim();if(s&&s.length<220)out.push(s)}else candidates(v,out)}}return out}
+function candidates(value,out=[]){if(typeof value==='string'){const s=value.trim();const matches=[...s.matchAll(/(?:https?:\/\/[^\s|,]+|sc-domain:[^\s|,]+)/g)].map(m=>m[0].replace(/[),.;]+$/,''));if(matches.length)out.push(...matches);else if(/^[a-z0-9.-]+\.[a-z]{2,}(?:\/[^\s|,]*)?$/i.test(s))out.push(s);return out}if(Array.isArray(value)){for(const v of value)candidates(v,out);return out}if(value&&typeof value==='object'){for(const[k,v]of Object.entries(value)){if(typeof v==='string'&&/(site|domain|property|name)/i.test(k)){const s=v.trim();if(s&&s.length<220)candidates(s,out)}else candidates(v,out)}}return out}
+function propertyHost(value){const s=String(value||'').trim().toLowerCase();if(s.startsWith('sc-domain:'))return s.slice(10).replace(/^www\./,'');try{return new URL(s.includes('://')?s:`https://${s}`).hostname.replace(/^www\./,'')}catch{return ''}}
+function autoSelectSeoSite(urls=urlList.value.split(/\r?\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#'))){const input=$('#seogets-site');if(input.value&&input.value!==autoSeoSite)return;input.value='';autoSeoSite='';const hosts=urls.map(x=>{try{return new URL(x).hostname.toLowerCase().replace(/^www\./,'')}catch{return ''}}).filter(Boolean);if(!hosts.length||!seogetsChoices.length)return;const site=seogetsChoices.find(choice=>{const domain=propertyHost(choice);return domain&&hosts.every(host=>host===domain||host.endsWith(`.${domain}`))});if(site){input.value=site;autoSeoSite=site;setStatus('#seogets-status',`Verification will use ${site} for the submitted URLs.`,'success')}}
+async function loadSeoSites(){const button=$('#check-seogets');if(button)button.disabled=true;setStatus('#seogets-status','Loading SEO Gets properties…');try{const data=await api('/api/seogets/sites',{});seogetsChoices=[...new Set(candidates(data.sites))];$('#seogets-sites').replaceChildren(...seogetsChoices.map(x=>{const o=document.createElement('option');o.value=x;return o}));if(!seogetsChoices.length)throw new Error('Connected to SEO Gets, but no site properties were returned.');autoSelectSeoSite();if(!$('#seogets-site').value)setStatus('#seogets-status',`${seogetsChoices.length} properties found. Enter the URL list to auto-select its matching property, or choose one.`,'success')}catch(e){setStatus('#seogets-status',e.message,'error')}finally{if(button)button.disabled=false}}
+$('#seogets-site').addEventListener('input',()=>{if($('#seogets-site').value!==autoSeoSite)autoSeoSite=''});
+$('#check-seogets').addEventListener('click',()=>{seoSitesPromise=loadSeoSites()});
+seoSitesPromise=loadSeoSites();
 
-$('#check-seogets').addEventListener('click',async()=>{const button=$('#check-seogets');button.disabled=true;setStatus('#seogets-status','Connecting to SEO Gets…');try{const data=await api('/api/seogets/sites',{});const choices=[...new Set(candidates(data.sites))];$('#seogets-sites').replaceChildren(...choices.map(x=>{const o=document.createElement('option');o.value=x;return o}));setStatus('#seogets-status',choices.length?`Connected. ${choices.length} site${choices.length===1?'':'s'} found; choose or enter the exact property name.`:`Connected. Enter the exact property name shown in SEO Gets. Read-only tools available: ${(data.read_tools||[]).join(', ')}.`,'success')}catch(e){setStatus('#seogets-status',e.message,'error')}finally{button.disabled=false}});
-
-async function config(){return api('/api/config')}
-$('#connect-cloud').addEventListener('click',async()=>{const button=$('#connect-cloud');button.disabled=true;setStatus('#cloud-status','Checking Google Cloud sign-in setup…');try{const cfg=await config();if(!cfg.google_oauth_client_id)throw new Error('Google OAuth client ID is not configured yet. Add GOOGLE_OAUTH_CLIENT_ID to Wrangler variables.');if(!window.google?.accounts?.oauth2)throw new Error('Google sign-in is still loading. Wait a moment and try again.');const client=google.accounts.oauth2.initTokenClient({client_id:cfg.google_oauth_client_id,scope:'https://www.googleapis.com/auth/cloud-platform',callback:response=>{button.disabled=false;if(response.error){cloudToken='';setStatus('#cloud-status',`Google sign-in failed: ${response.error}`,'error');return}cloudToken=response.access_token;setStatus('#cloud-status','Google Cloud connected for this browser session. Vertex AI and entity analysis can run.','success')}});client.requestAccessToken({prompt:'consent'})}catch(e){button.disabled=false;setStatus('#cloud-status',e.message,'error')}});
+async function showGoogleStatus(){try{const cfg=await api('/api/config');setStatus('#cloud-status',cfg.google_cloud_configured?`Google Cloud analysis is enabled by default for project ${cfg.google_cloud_project}.`:'Google Cloud service account is not set in Cloudflare yet; add it before running an analysis.',cfg.google_cloud_configured?'success':'') }catch(e){setStatus('#cloud-status',e.message,'error')}}
+showGoogleStatus();
 
 function showError(message){const el=$('#progress-card');el.classList.remove('hidden');$('#progress-title').textContent='Could not complete the analysis';$('#progress-phase').textContent=message;$('#progress-percent').textContent='';$('#progress-fill').style.width='0%';analyzeButton.disabled=false}
 async function beginAnalysis(){
@@ -39,8 +43,8 @@ async function beginAnalysis(){
   const urls=urlList.value.split(/\r?\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#'));
   if(csvFile.files[0])try{urls.push(...parseCsv(await csvFile.files[0].text()))}catch{showError('Could not read the CSV file.');return}
   $('#progress-card').classList.remove('hidden');$('#result-card').classList.add('hidden');$('#progress-title').textContent='Reading and comparing your pages…';$('#progress-phase').textContent=`Submitting ${urls.length} URLs`;$('#progress-percent').textContent='0%';$('#progress-fill').style.width='0%';analyzeButton.disabled=true;
-  const site=$('#seogets-site').value.trim();
-  try{const data=await api('/api/analyze',{urls,threshold:Number($('#threshold').value),seogets_site:site,start_date:$('#start-date').value,end_date:$('#end-date').value,google_cloud_token:cloudToken});$('#progress-percent').textContent='100%';$('#progress-fill').style.width='100%';$('#progress-phase').textContent='Report ready';await showResult(data.result)}catch(e){showError(e.message)}
+  await seoSitesPromise;autoSelectSeoSite(urls);const site=$('#seogets-site').value.trim();if(!site){showError('Could not match these URLs to an SEO Gets property. Choose the matching property before running verification.');return}
+  try{const data=await api('/api/analyze',{urls,threshold:Number($('#threshold').value),seogets_site:site,start_date:$('#start-date').value,end_date:$('#end-date').value});$('#progress-percent').textContent='100%';$('#progress-fill').style.width='100%';$('#progress-phase').textContent='Report ready';await showResult(data.result)}catch(e){showError(e.message)}
 }
 
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}

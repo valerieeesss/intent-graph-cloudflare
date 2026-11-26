@@ -137,8 +137,40 @@ async function googlePost(url, token, project, payload) {
   return response.json();
 }
 
+let googleTokenCache = null;
+function base64Url(value) {
+  const bytes = typeof value === 'string' ? new TextEncoder().encode(value) : value;
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+async function googleCloudAccessToken(env) {
+  if (!env.GOOGLE_SERVICE_ACCOUNT_JSON) return null;
+  if (googleTokenCache && googleTokenCache.expiresAt > Date.now() + 60000) return googleTokenCache.token;
+  let account;
+  try { account = JSON.parse(env.GOOGLE_SERVICE_ACCOUNT_JSON); }
+  catch { throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.'); }
+  if (!account.client_email || !account.private_key) throw new Error('Google service account secret must include client_email and private_key.');
+  const now = Math.floor(Date.now() / 1000), audience = 'https://oauth2.googleapis.com/token';
+  const header = base64Url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const claims = base64Url(JSON.stringify({ iss: account.client_email, scope: 'https://www.googleapis.com/auth/cloud-platform', aud: audience, iat: now, exp: now + 3600 }));
+  const unsigned = `${header}.${claims}`;
+  const pem = account.private_key.replace(/\\n/g, '\n');
+  const der = Uint8Array.from(atob(pem.replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\s/g, '')), c => c.charCodeAt(0));
+  const key = await crypto.subtle.importKey('pkcs8', der, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+  const signature = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(unsigned));
+  const assertion = `${unsigned}.${base64Url(new Uint8Array(signature))}`;
+  const response = await fetch(audience, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion }), signal: AbortSignal.timeout(30000) });
+  if (!response.ok) throw new Error(`Google token request failed (HTTP ${response.status}).`);
+  const result = await response.json();
+  if (!result.access_token) throw new Error('Google did not return an access token.');
+  googleTokenCache = { token: result.access_token, expiresAt: Date.now() + Number(result.expires_in || 3600) * 1000 };
+  return googleTokenCache.token;
+}
+
 async function vertexEmbeddings(docs, token, env) {
-  if (!token || !env.GOOGLE_CLOUD_PROJECT) return null;
+  if (!token || !env.GOOGLE_CLOUD_PROJECT) throw new Error('Google Cloud credentials or project are missing.');
   try {
     const location = env.GOOGLE_CLOUD_LOCATION || 'us-central1', project = env.GOOGLE_CLOUD_PROJECT;
     const endpoint = `https://${location}-aiplatform.googleapis.com/v1/projects/${encodeURIComponent(project)}/locations/${location}/publishers/google/models/${encodeURIComponent(env.VERTEX_EMBEDDING_MODEL || 'gemini-embedding-001')}:predict`;
@@ -147,12 +179,13 @@ async function vertexEmbeddings(docs, token, env) {
       const result = await googlePost(endpoint, token, project, { instances: docs.slice(i, i + 5).map(d => ({ content: d.text.slice(0, 8000), task_type: 'RETRIEVAL_DOCUMENT' })), parameters: { outputDimensionality: 768 } });
       all.push(...(result.predictions || []).map(x => x.embeddings.values));
     }
-    return all.length === docs.length ? all : null;
-  } catch { return null; }
+    if (all.length !== docs.length) throw new Error('Vertex AI returned an incomplete embeddings response.');
+    return all;
+  } catch (e) { throw new Error(`Vertex AI embeddings failed: ${e.message}`); }
 }
 
-async function entities(docs, token, env) {
-  if (!token || !env.GOOGLE_CLOUD_PROJECT) return docs.map(() => ({ name: 'Unavailable', type: '', salience: null, method: 'Google Cloud credentials unavailable' }));
+async function entities(docs, token, env, authError = '') {
+  if (!token || !env.GOOGLE_CLOUD_PROJECT) return docs.map(() => ({ name: 'Unavailable', type: '', salience: null, method: authError ? `Google Cloud authentication unavailable (${authError})` : 'Google Cloud service account not configured' }));
   return mapLimit(docs, 4, async d => {
     try {
       const result = await googlePost('https://language.googleapis.com/v1/documents:analyzeEntities', token, env.GOOGLE_CLOUD_PROJECT, { document: { type: 'PLAIN_TEXT', content: d.text.slice(0, 9000) }, encodingType: 'UTF8' });
@@ -298,7 +331,7 @@ async function handle(request, env) {
   if (url.pathname.startsWith('/api/')) {
     const origin = request.headers.get('origin');
     if (origin && origin !== url.origin) return json({ error: 'Cross-origin request blocked.' }, 403);
-    if (request.method === 'GET' && url.pathname === '/api/config') return json({ google_oauth_client_id: env.GOOGLE_OAUTH_CLIENT_ID || '', google_cloud_project: env.GOOGLE_CLOUD_PROJECT || '', seogets_configured: Boolean(env.SEOGETS_API_KEY), claude_configured: Boolean(env.ANTHROPIC_API_KEY) });
+    if (request.method === 'GET' && url.pathname === '/api/config') return json({ google_cloud_project: env.GOOGLE_CLOUD_PROJECT || '', google_cloud_configured: Boolean(env.GOOGLE_SERVICE_ACCOUNT_JSON), seogets_configured: Boolean(env.SEOGETS_API_KEY), claude_configured: Boolean(env.ANTHROPIC_API_KEY) });
     if (request.method === 'POST' && url.pathname === '/api/seogets/sites') return listSeoGetsSites(env);
     if (request.method === 'POST' && url.pathname === '/api/analyze') return analyze(request, env);
     if (request.method === 'GET' && url.pathname === '/api/health') return json({ ok: true });
@@ -331,7 +364,10 @@ async function analyze(request, env) {
   catch (e) { return json({ error: e.message }, 400); }
   if (requested.length < 2) return json({ error: 'Add at least two different URLs.' }, 400);
   const startDate = String(body.start_date || ''), endDate = String(body.end_date || ''), site = String(body.seogets_site || '').trim();
-  if (site && (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate) || startDate > endDate)) return json({ error: 'Choose a valid Search Console date range.' }, 400);
+  if (!site) return json({ error: 'Select the matching SEO Gets property so search verification can run.' }, 400);
+  if (!env.SEOGETS_API_KEY) return json({ error: 'SEO Gets is not configured in the Worker. Add its API key as SEOGETS_API_KEY.' }, 503);
+  if (!env.GOOGLE_SERVICE_ACCOUNT_JSON) return json({ error: 'Google Cloud is not configured in the Worker. Add a service account as GOOGLE_SERVICE_ACCOUNT_JSON.' }, 503);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate) || startDate > endDate) return json({ error: 'Choose a valid Search Console date range.' }, 400);
 
   const errors = [], docs = [];
   await mapLimit(requested, 4, async original => {
@@ -345,7 +381,13 @@ async function analyze(request, env) {
   for (const d of docs.filter(d => d.text.length < 100)) errors.push({ url: d.url, error: 'Repeated site text left too little unique content.' });
   if (!usable.length) return json({ error: 'No unique page content remained after repeated site text was removed.', errors }, 422);
 
-  const cloudToken = String(body.google_cloud_token || ''), embedded = await vertexEmbeddings(usable, cloudToken, env), vector = vectors(usable), intent = await claudeAnalysis(usable, env), entity = await entities(usable, cloudToken, env);
+  let cloudToken = null, googleAuthError = '';
+  try { cloudToken = await googleCloudAccessToken(env); if (!cloudToken) throw new Error('Google service account returned no token.'); }
+  catch (e) { googleAuthError = e.message.slice(0, 120); return json({ error: `Google Cloud authentication failed: ${googleAuthError}` }, 502); }
+  let embedded;
+  try { embedded = await vertexEmbeddings(usable, cloudToken, env); }
+  catch (e) { return json({ error: e.message.slice(0, 300) }, 502); }
+  const vector = vectors(usable), intent = await claudeAnalysis(usable, env), entity = await entities(usable, cloudToken, env, googleAuthError);
   const nodes = usable.map((d, i) => ({ id: i, url: d.url, title: d.title, type: 'page', chars: d.chars, template_chars_removed: d.template_chars_removed || 0, intent: intent[i].intent, intent_confidence: Number(intent[i].confidence) || 0, intent_evidence: intent[i].evidence || '', intent_source: intent[i].source, expected_role: intent[i].expected_role || 'unclear', expected_role_confidence: Number(intent[i].expected_role_confidence) || 0, expected_role_evidence: intent[i].expected_role_evidence || '', role_source: intent[i].role_source, role_fit: intent[i].role_fit || 'unclear', role_evidence: intent[i].role_evidence || '', depth_score: intent[i].depth_score, closest_entity: entity[i].name, closest_entity_type: entity[i].type, closest_entity_salience: entity[i].salience, entity_method: entity[i].method, text_excerpt: d.text.slice(0, 700) }));
 
   let rows = [], gscStatus = { method: 'SEO Gets MCP', status: 'not-connected', site, start_date: startDate, end_date: endDate, rows: 0, truncated: false, message: 'Enter an SEO Gets site and date range to add query-overlap evidence.' };

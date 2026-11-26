@@ -36,20 +36,20 @@
       <div class="threshold-control"><label for="threshold">Show matches from <strong><span id="threshold-value">85</span>%</strong></label><input id="threshold" type="range" min="10" max="90" value="85"><div class="range-labels"><span>More connections</span><span>Stronger matches</span></div></div>
         <button id="analyze" class="primary-button" type="button"><span>Build my graph</span><span class="button-arrow">→</span></button>
       </div>
-      <p class="privacy-note">Pages are fetched for analysis. Claude reads the extracted page text and URL slug. Google Cloud can add embeddings and closest-entity salience when connected.</p>
+      <p class="privacy-note">Pages are fetched for analysis. Claude reads the extracted page text and URL slug. Google Cloud analysis and SEO Gets verification run automatically when configured.</p>
     </section>
 
-    <section class="workspace evidence-workspace" aria-label="Optional search performance evidence">
-      <div class="step-head"><div><span class="step-number">02</span><h2>Validate with SEO Gets</h2></div><span class="small-note">Optional · read-only Search Console data</span></div>
+    <section class="workspace evidence-workspace" aria-label="Search performance verification">
+      <div class="step-head"><div><span class="step-number">02</span><h2>Search verification</h2></div><span class="small-note">Automatic · read-only Search Console data</span></div>
       <p class="evidence-intro">See whether multiple pages receive impressions for the same Google searches. SEO Gets supplies Search Console performance data; this app shows the query overlap separately from content similarity.</p>
       <div class="evidence-controls">
-        <label class="field-label" for="seogets-site">SEO Gets property <span>enter its exact site name</span></label>
-        <div class="site-row"><input id="seogets-site" list="seogets-sites" placeholder="e.g. westpac.com.au"><datalist id="seogets-sites"></datalist><button id="check-seogets" class="secondary-button" type="button">Check connection</button></div>
+        <label class="field-label" for="seogets-site">SEO Gets property <span>auto-matched from the pasted URLs</span></label>
+        <div class="site-row"><input id="seogets-site" list="seogets-sites" placeholder="Auto-matched when URL list is entered"><datalist id="seogets-sites"></datalist><button id="check-seogets" class="secondary-button" type="button">Refresh properties</button></div>
         <div class="date-row"><label class="field-label" for="start-date">From <input id="start-date" type="date"></label><label class="field-label" for="end-date">To <input id="end-date" type="date"></label></div>
-        <div id="seogets-status" class="connection-status" aria-live="polite">SEO Gets evidence is optional. Its API key stays on the server.</div>
+        <div id="seogets-status" class="connection-status" aria-live="polite">Loading SEO Gets properties for automatic verification…</div>
       </div>
-      <div class="cloud-auth-row"><div><strong>Google Cloud analysis</strong><p>Optional connection for Vertex AI embeddings and Google entity salience.</p></div><button id="connect-cloud" class="secondary-button" type="button">Connect Google Cloud</button></div>
-      <div id="cloud-status" class="connection-status" aria-live="polite">Not connected; content similarity will use local TF-IDF.</div>
+      <div class="cloud-auth-row"><div><strong>Google Cloud analysis</strong><p>Runs automatically through the app’s server-side Google service account.</p></div></div>
+      <div id="cloud-status" class="connection-status" aria-live="polite">Checking Google Cloud configuration…</div>
     </section>
 
     <section class="progress-card hidden" id="progress-card" aria-live="polite">
@@ -69,7 +69,6 @@
     <section class="how-grid"><article><span>01 / READ</span><h3>Pages, not URL guesses</h3><p>The app extracts readable text from each page before comparing anything.</p></article><article><span>02 / COMPARE</span><h3>Cleaned similarity with evidence</h3><p>Repeated navigation, footer, and same-site template text is filtered before matching and evidence selection.</p></article><article><span>03 / UNDERSTAND</span><h3>Intent in context</h3><p>Claude infers expected role from the URL slug, then checks current intent and role depth against the fetched page text.</p></article></section>
     <footer><span>PAGEGRAPH · EARLY ACCESS</span><span>Analysis is a signal for review, not an automatic content decision.</span></footer>
   </main>
-  <script src="https://accounts.google.com/gsi/client" async defer></script>
   <script src="/app.js"></script>
 </body>
 </html>

@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "intent-graph",
+  "name": "intent-graph-cloudflare",
   "main": "src/index.js",
   "compatibility_date": "2026-11-26",
   "assets": {
@@ -12,10 +12,9 @@
     "GOOGLE_CLOUD_PROJECT": "entity-detector-510013",
     "GOOGLE_CLOUD_LOCATION": "us-central1",
     "VERTEX_EMBEDDING_MODEL": "gemini-embedding-001",
-    "ANTHROPIC_MODEL": "claude-sonnet-4-6",
-    "GOOGLE_OAUTH_CLIENT_ID": ""
+    "ANTHROPIC_MODEL": "claude-sonnet-4-6"
   },
   "secrets": {
-    "required": ["SEOGETS_API_KEY"]
+    "required": ["SEOGETS_API_KEY", "GOOGLE_SERVICE_ACCOUNT_JSON"]
   }
 }
