@@ -1,4 +1,3 @@
 # Copy to .dev.vars for local Wrangler development; never commit .dev.vars.
-APP_PASSWORD=choose-a-private-local-password
 SEOGETS_API_KEY=paste-your-seogets-mcp-key-here
 ANTHROPIC_API_KEY=paste-your-anthropic-key-here

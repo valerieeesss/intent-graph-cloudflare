@@ -1,15 +1,12 @@
 const $=s=>document.querySelector(s);
 const urlList=$('#url-list'),csvFile=$('#csv-file'),analyzeButton=$('#analyze');
-let appPassword=sessionStorage.getItem('intentGraphPassword')||'',cloudToken='',reportBlob=null;
+let cloudToken='',reportBlob=null;
 
 function setStatus(id,message,kind=''){const el=$(id);el.textContent=message;el.className=`connection-status ${kind}`.trim()}
-function basicHeader(){return `Basic ${btoa(`intent-graph:${appPassword}`)}`}
 async function api(path,body){
-  if(!appPassword){appPassword=prompt('Enter the Intent Graph app password:')||'';if(!appPassword)throw new Error('App password is required.');sessionStorage.setItem('intentGraphPassword',appPassword)}
-  const options={method:body===undefined?'GET':'POST',headers:{authorization:basicHeader()}};
+  const options={method:body===undefined?'GET':'POST',headers:{}};
   if(body!==undefined){options.headers['content-type']='application/json';options.body=JSON.stringify(body)}
-  let response=await fetch(path,options);
-  if(response.status===401){sessionStorage.removeItem('intentGraphPassword');appPassword=prompt('That password did not work. Enter the app password again:')||'';if(!appPassword)throw new Error('App password is required.');sessionStorage.setItem('intentGraphPassword',appPassword);options.headers.authorization=basicHeader();response=await fetch(path,options)}
+  const response=await fetch(path,options);
   const data=await response.json().catch(()=>({error:'The server returned an unreadable response.'}));
   if(!response.ok)throw new Error(data.error||`Server returned ${response.status}.`);return data;
 }

@@ -21,25 +21,6 @@ async function mapLimit(items, limit, fn) {
   return output;
 }
 
-function safeEqual(a, b) {
-  let diff = a.length ^ b.length;
-  const size = Math.max(a.length, b.length);
-  for (let i = 0; i < size; i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
-  return diff === 0;
-}
-
-function authorized(request, env) {
-  const configured = String(env.APP_PASSWORD || "");
-  if (!configured) return false;
-  const header = request.headers.get("authorization") || "";
-  if (!header.startsWith("Basic ")) return false;
-  try {
-    const decoded = atob(header.slice(6));
-    const colon = decoded.indexOf(":");
-    return colon >= 0 && safeEqual(decoded.slice(colon + 1), configured);
-  } catch { return false; }
-}
-
 function validUrl(value) {
   let u;
   try { u = new URL(String(value)); } catch { throw new Error(`Invalid URL: ${value}`); }
@@ -315,8 +296,6 @@ function components(nodes, links) {
 async function handle(request, env) {
   const url = new URL(request.url);
   if (url.pathname.startsWith('/api/')) {
-    if (!env.APP_PASSWORD) return json({ error: 'Worker is not configured. Set APP_PASSWORD in Cloudflare secrets.' }, 503);
-    if (!authorized(request, env)) return json({ error: 'Enter the app password to continue.' }, 401, { 'www-authenticate': 'Basic realm="Intent Graph"' });
     const origin = request.headers.get('origin');
     if (origin && origin !== url.origin) return json({ error: 'Cross-origin request blocked.' }, 403);
     if (request.method === 'GET' && url.pathname === '/api/config') return json({ google_oauth_client_id: env.GOOGLE_OAUTH_CLIENT_ID || '', google_cloud_project: env.GOOGLE_CLOUD_PROJECT || '', seogets_configured: Boolean(env.SEOGETS_API_KEY), claude_configured: Boolean(env.ANTHROPIC_API_KEY) });

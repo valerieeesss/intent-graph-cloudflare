@@ -14,11 +14,11 @@ Requirements: Node.js 20+ and npm.
 ```bash
 npm install
 cp .dev.vars.example .dev.vars
-# Edit .dev.vars with a private app password, SEO Gets MCP key, and Anthropic key.
+# Edit .dev.vars with your SEO Gets MCP key and Anthropic key.
 npm run dev
 ```
 
-Open the local URL Wrangler prints. The app password protects all API routes. Enter it when prompted in the browser; it is held in that tab's `sessionStorage`.
+Open the local URL Wrangler prints. The app is public: anyone who can reach it can submit analyses, which may use your SEO Gets and Anthropic accounts.
 
 The SEO Gets key is server-side only. In SEO Gets, create one under **Settings → MCP**. The Worker calls only the read-only `list_sites` and `get_site_performance` tools. It does not call tools that write to SEO Gets. SEO Gets MCP access requires an eligible subscription. Because SEO Gets supplies the Search Console data, this app does not need its own Search Console OAuth connection.
 
@@ -33,21 +33,15 @@ The default project is `entity-detector-510013`. Enabling APIs does not run requ
 Set these as encrypted Worker secrets. Do not commit them or add them to `wrangler.jsonc`:
 
 ```bash
-npx wrangler secret put APP_PASSWORD
 npx wrangler secret put SEOGETS_API_KEY
 npx wrangler secret put ANTHROPIC_API_KEY
 ```
 
-`APP_PASSWORD` and `SEOGETS_API_KEY` are required to deploy. `ANTHROPIC_API_KEY` is optional; without it, page-role and intent fields use local heuristics. For local development, `.dev.vars` supplies these same values and is git-ignored.
+`SEOGETS_API_KEY` is needed for Search Console evidence. `ANTHROPIC_API_KEY` is optional; without it, page-role and intent fields use local heuristics. For local development, `.dev.vars` supplies these values and is git-ignored. Keep both keys server-side; the public app can still trigger usage against these accounts.
 
-## GitHub deployment
+## Manual Cloudflare deployment
 
-The included GitHub Actions workflow deploys on pushes to `main`. Add these repository Actions secrets:
-
-- `CLOUDFLARE_API_TOKEN` with permission to deploy Workers.
-- `CLOUDFLARE_ACCOUNT_ID` for the target Cloudflare account.
-
-Set the Worker runtime secrets once with Wrangler as shown above. The OAuth client ID and Google Cloud project are non-secret Worker variables in `wrangler.jsonc`.
+GitHub is used to store the source code; pushing to GitHub does not deploy the app. To deploy manually, create a Worker named `intent-graph`, authenticate Wrangler with `npx wrangler login`, add the Worker secrets above with `npx wrangler secret put`, then run `npm run deploy` from this directory. Wrangler uploads the Worker and the `public/` assets together. The OAuth client ID and Google Cloud project are non-secret Worker variables in `wrangler.jsonc`.
 
 ## Search evidence behavior
 
@@ -66,4 +60,4 @@ The shared metric is a conservative pair-level comparison, not an additional GSC
 - `POST /api/seogets/sites` — checks the SEO Gets connection and lists sites using its read-only tool.
 - `POST /api/analyze` — fetches pages, compares content, and optionally adds SEO Gets search evidence.
 
-The Worker blocks local/private hostnames and direct IP-address URLs, limits analyses to 100 pages, and does not retain the submitted SEO Gets or Google Cloud access tokens. Analyses of this size can exceed Cloudflare Workers Free request limits; use a paid Workers plan for larger runs. Third-party API usage may also be billable.
+The Worker blocks local/private hostnames and direct IP-address URLs, limits analyses to 100 pages, and does not retain the submitted SEO Gets or Google Cloud access tokens. The app has no sign-in: anyone with the public URL can run analyses and trigger third-party usage. Analyses of this size can exceed Cloudflare Workers Free request limits; use a paid Workers plan for larger runs. Third-party API usage may also be billable.

@@ -16,6 +16,6 @@
     "GOOGLE_OAUTH_CLIENT_ID": ""
   },
   "secrets": {
-    "required": ["APP_PASSWORD", "SEOGETS_API_KEY"]
+    "required": ["SEOGETS_API_KEY"]
   }
 }
