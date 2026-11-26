@@ -66,4 +66,4 @@ The shared metric is a conservative pair-level comparison, not an additional GSC
 - `POST /api/seogets/sites` — checks the SEO Gets connection and lists sites using its read-only tool.
 - `POST /api/analyze` — fetches pages, compares content, and optionally adds SEO Gets search evidence.
 
-The Worker blocks local/private hostnames and IP-address URLs, limits analyses to 100 pages, and does not retain the submitted SEO Gets or Google Cloud access tokens. Analyses of this size can exceed Cloudflare Workers Free request limits; use a paid Workers plan for larger runs. Third-party API usage may also be billable.
+The Worker blocks local/private hostnames and direct IP-address URLs, limits analyses to 100 pages, and does not retain the submitted SEO Gets or Google Cloud access tokens. Analyses of this size can exceed Cloudflare Workers Free request limits; use a paid Workers plan for larger runs. Third-party API usage may also be billable.
