@@ -516,8 +516,9 @@ async function fetchAhrefsVolumes(queries, env) {
 function sheetInsights(node, overlapping, page6, previous3, recent3, ahrefs) {
   const tags = [], problems = [], actions = [];
   if (overlapping.length) {
-    const queries = [...new Set(overlapping.flatMap(pair => pair.shared_queries.map(item => item.query)))];
-    const queryPairCount = overlapping.reduce((sum, pair) => sum + pair.shared_query_count, 0);
+    const queryMetrics = overlapping.map(pair => pair.metrics || pair);
+    const queries = [...new Set(queryMetrics.flatMap(pair => (pair.shared_queries || []).map(item => item.query)))];
+    const queryPairCount = queryMetrics.reduce((sum, pair) => sum + (Number(pair.shared_query_count) || 0), 0);
     tags.push(`Cannibalisation (${queries.slice(0, 3).join(', ') || `${overlapping.length} page pair(s)`})`);
     const competitors = [...new Set(overlapping.map(pair => pair.other_title))];
     problems.push(`Has ${queryPairCount} shared query/page-pair matches with ${competitors.slice(0, 3).join('; ')} across the six-month window${queries.length ? `, including “${queries.slice(0, 3).join('”, “')}”` : ''}. This is a search-overlap signal, not proof that cannibalisation is harming rankings.`);
@@ -603,7 +604,13 @@ async function handle(request, env) {
     if (request.method === 'GET' && url.pathname === '/api/config') return json({ google_cloud_project: env.GOOGLE_CLOUD_PROJECT || '', google_cloud_configured: Boolean(env.GOOGLE_SERVICE_ACCOUNT_JSON), google_oauth_configured: Boolean(env.GOOGLE_OAUTH_CLIENT_ID && env.GOOGLE_OAUTH_CLIENT_SECRET), ahrefs_configured: Boolean(env.AHREFS_API_KEY), claude_configured: Boolean(env.ANTHROPIC_API_KEY) });
     if (request.method === 'GET' && url.pathname === '/api/google/status') return googleOAuthStatus(request, env);
     if (request.method === 'POST' && url.pathname === '/api/google/disconnect') return json({ ok: true }, 200, { 'set-cookie': clearCookieHeader(GSC_TOKEN_COOKIE) });
-    if (request.method === 'POST' && url.pathname === '/api/analyze') return analyze(request, env);
+    if (request.method === 'POST' && url.pathname === '/api/analyze') {
+      try { return await analyze(request, env); }
+      catch (error) {
+        console.error('Unhandled analysis error', error?.stack || error?.message || String(error));
+        return json({ error: `Analysis failed unexpectedly: ${String(error?.message || error).slice(0, 220)}` }, 500);
+      }
+    }
     if (request.method === 'GET' && url.pathname === '/api/health') return json({ ok: true });
     return json({ error: 'API route not found.' }, 404);
   }
