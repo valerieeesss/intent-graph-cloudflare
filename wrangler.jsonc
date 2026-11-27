@@ -16,5 +16,11 @@
   },
   "secrets": {
     "required": ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+  },
+"observability": {
+    "logs": {
+      "enabled": false,
+      "invocation_logs": true
+    }
   }
 }
