@@ -7,7 +7,8 @@ async function api(path,body){
   const options={method:body===undefined?'GET':'POST',headers:{}};
   if(body!==undefined){options.headers['content-type']='application/json';options.body=JSON.stringify(body)}
   const response=await fetch(path,options);
-  const data=await response.json().catch(()=>({error:'The server returned an unreadable response.'}));
+  const raw=await response.text();let data;
+  try{data=raw?JSON.parse(raw):{}}catch{const detail=raw.replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim().slice(0,240);throw new Error(`Cloudflare returned HTTP ${response.status}${detail?`: ${detail}`:' without a readable error.'}`)}
   if(!response.ok)throw new Error(data.error||`Server returned ${response.status}.`);return data;
 }
 

@@ -102,7 +102,17 @@ function vectors(docs) {
   for (const row of words) for (const word of new Set(row)) df.set(word, (df.get(word) || 0) + 1);
   return words.map(row => { const tf = new Map(); for (const word of row) tf.set(word, (tf.get(word) || 0) + 1); const n = Math.max(row.length, 1); return Object.fromEntries([...tf].map(([word, count]) => [word, count / n * (Math.log((docs.length + 1) / ((df.get(word) || 0) + 1)) + 1)])); });
 }
-function cosine(a, b) { let dot = 0, na = 0, nb = 0; for (const [k, v] of Object.entries(a)) { dot += v * (b[k] || 0); na += v * v; } for (const v of Object.values(b)) nb += v * v; return na && nb ? dot / Math.sqrt(na * nb) : 0; }
+function vectorNorm(vector) { let sum = 0; if (Array.isArray(vector)) { for (const value of vector) sum += value * value; } else { for (const value of Object.values(vector)) sum += value * value; } return Math.sqrt(sum); }
+function cosine(a, b, normA = vectorNorm(a), normB = vectorNorm(b)) {
+  if (!normA || !normB) return 0;
+  let dot = 0;
+  if (Array.isArray(a) && Array.isArray(b)) { for (let i = 0; i < Math.min(a.length, b.length); i++) dot += a[i] * b[i]; }
+  else {
+    const [smaller, larger] = Object.keys(a).length <= Object.keys(b).length ? [a, b] : [b, a];
+    for (const [key, value] of Object.entries(smaller)) dot += value * (larger[key] || 0);
+  }
+  return dot / (normA * normB);
+}
 function keywords(a, b, limit = 7) { return Object.keys(a).filter(k => Object.hasOwn(b, k)).sort((x, y) => (a[y] + b[y]) - (a[x] + b[x])).slice(0, limit); }
 function snippet(text, terms) { const sentences = text.split(/(?<=[.!?])\s+/); return (sentences.find(s => s.length > 45 && terms.slice(0, 4).some(t => s.toLowerCase().includes(t))) || sentences[0] || text).slice(0, 360); }
 
@@ -299,8 +309,17 @@ function shiftIsoMonths(value, amount) {
   return `${targetYear}-${String(targetMonth + 1).padStart(2, '0')}-${String(targetDay).padStart(2, '0')}`;
 }
 function shiftIsoDays(value, amount) { const date = new Date(`${value}T00:00:00Z`); date.setUTCDate(date.getUTCDate() + amount); return date.toISOString().slice(0, 10); }
-function summarizePagePerformance(rows, doc) {
-  const matching = rows.filter(row => row.page === normalizePage(doc.url));
+function indexGscRowsByPage(rows) {
+  const pages = new Map();
+  for (const row of rows) {
+    const key = normalizePage(row.page), pageRows = pages.get(key) || new Map();
+    pageRows.set(row.query.toLowerCase(), row);
+    pages.set(key, pageRows);
+  }
+  return pages;
+}
+function summarizePagePerformance(rowsByPage, doc) {
+  const matching = [...(rowsByPage.get(normalizePage(doc.url))?.values() || [])];
   return { clicks: matching.reduce((sum, row) => sum + row.clicks, 0), impressions: matching.reduce((sum, row) => sum + row.impressions, 0), queries: [...new Set(matching.map(row => row.query.toLowerCase()))].length };
 }
 function percentChange(current, previous) { return previous > 0 ? Math.round(((current - previous) / previous) * 1000) / 10 : null; }
@@ -339,13 +358,13 @@ async function pageQueryRows(token, property, doc, startDate, endDate) {
   const all = [], rowLimit = 25000;
   for (let startRow = 0; startRow < 50000; startRow += rowLimit) {
     const body = await gscRequest(`https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(property)}/searchAnalytics/query`, token, {
-      startDate, endDate, dimensions: ['date', 'query'], type: 'web', rowLimit, startRow,
+      startDate, endDate, dimensions: ['query'], type: 'web', rowLimit, startRow,
       dimensionFilterGroups: [{ groupType: 'and', filters: [{ dimension: 'page', operator: 'equals', expression: pageUrl }] }]
     });
     const rows = body.rows || []; all.push(...rows);
     if (rows.length < rowLimit) break;
   }
-  return { page: doc.url, rows: all };
+  return { page: doc.url, rows: all.map(row => ({ ...row, keys: [endDate, row.keys?.[0]] })) };
 }
 function aggregateGscRows(pageRows, startDate, endDate, normalize = normalizePage) {
   const grouped = new Map();
@@ -377,15 +396,20 @@ async function fetchGoogleSearchData(token, docs, startDate, endDate) {
   if (!site) throw new Error('The signed-in Google account has no Search Console property that covers all submitted URLs. Add it in Search Console or choose URLs from one property.');
   const halfStart = shiftIsoMonths(endDate, -3), firstEnd = shiftIsoDays(halfStart, -1);
   const settled = await mapLimit(docs, 4, async doc => {
-    try { return { ok: true, result: await pageQueryRows(token, site, doc, startDate, endDate), doc }; }
+    try {
+      const previousThreeMonths = await pageQueryRows(token, site, doc, startDate, firstEnd);
+      const recentThreeMonths = await pageQueryRows(token, site, doc, halfStart, endDate);
+      const last28Days = await pageQueryRows(token, site, doc, shiftIsoDays(endDate, -27), endDate);
+      return { ok: true, result: { previousThreeMonths, recentThreeMonths, last28Days }, doc };
+    }
     catch (error) { return { ok: false, message: `${doc.url}: ${error.message}` }; }
   });
   const successful = settled.filter(item => item.ok), failures = settled.filter(item => !item.ok);
-  const rows = aggregateGscRows(successful.map(item => item.result), startDate, endDate);
-  const previousRows = aggregateGscRows(successful.map(item => item.result), startDate, firstEnd);
-  const recentRows = aggregateGscRows(successful.map(item => item.result), halfStart, endDate);
   const cannibalStart = shiftIsoDays(endDate, -27);
-  const cannibalRows = aggregateGscRows(successful.map(item => item.result), cannibalStart, endDate, normalizeCannibalUrl);
+  const rows = aggregateGscRows(successful.flatMap(item => [item.result.previousThreeMonths, item.result.recentThreeMonths]), startDate, endDate);
+  const previousRows = aggregateGscRows(successful.map(item => item.result.previousThreeMonths), startDate, firstEnd);
+  const recentRows = aggregateGscRows(successful.map(item => item.result.recentThreeMonths), halfStart, endDate);
+  const cannibalRows = aggregateGscRows(successful.map(item => item.result.last28Days), cannibalStart, endDate, normalizeCannibalUrl);
   let queryTotals = new Map(), queryOnlyError = '';
   try { queryTotals = await queryOnlyImpressionTotals(token, site, cannibalStart, endDate); }
   catch (error) { queryOnlyError = error.message.slice(0, 220); }
@@ -541,17 +565,24 @@ function sheetInsights(node, overlapping, page6, previous3, recent3, ahrefs) {
 }
 
 function localRoleDescription(slug) { return slug.replace(/[-_]+/g, ' ').trim(); }
-function pairSharedQueries(a, b, rows) {
-  const am = new Map(), bm = new Map();
-  for (const row of rows) {
-    if (row.page === normalizePage(a.url)) am.set(row.query.toLowerCase(), row);
-    if (row.page === normalizePage(b.url)) bm.set(row.query.toLowerCase(), row);
+function pairSharedQueries(a, b, rowsByPage) {
+  const am = rowsByPage.get(normalizePage(a.url)) || new Map(), bm = rowsByPage.get(normalizePage(b.url)) || new Map();
+  const [smaller, larger, swapped] = am.size <= bm.size ? [am, bm, false] : [bm, am, true];
+  let sharedCount = 0, sharedImpressions = 0, sharedClicks = 0;
+  const topQueries = [];
+  for (const [q, smallRow] of smaller) {
+    const otherRow = larger.get(q);
+    if (!otherRow) continue;
+    const x = swapped ? otherRow : smallRow, y = swapped ? smallRow : otherRow;
+    const share = Math.min(x.impressions, y.impressions), clicks = Math.min(x.clicks, y.clicks);
+    sharedCount++; sharedImpressions += share; sharedClicks += clicks;
+    if (topQueries.length < 5 || share > topQueries[4].shared_impressions) {
+      topQueries.push({ query: x.query, a_impressions: x.impressions, b_impressions: y.impressions, shared_impressions: share, a_clicks: x.clicks, b_clicks: y.clicks, shared_clicks: clicks, a_position: x.position, b_position: y.position });
+      topQueries.sort((left, right) => right.shared_impressions - left.shared_impressions);
+      if (topQueries.length > 5) topQueries.pop();
+    }
   }
-  const shared = [...am.keys()].filter(q => bm.has(q)).map(q => {
-    const x = am.get(q), y = bm.get(q);
-    return { query: x.query, a_impressions: x.impressions, b_impressions: y.impressions, shared_impressions: Math.min(x.impressions, y.impressions), a_clicks: x.clicks, b_clicks: y.clicks, shared_clicks: Math.min(x.clicks, y.clicks), a_position: x.position, b_position: y.position };
-  }).sort((x, y) => y.shared_impressions - x.shared_impressions);
-  return { shared_query_count: shared.length, shared_impressions: shared.reduce((n, x) => n + x.shared_impressions, 0), shared_clicks: shared.reduce((n, x) => n + x.shared_clicks, 0), shared_queries: shared.slice(0, 5) };
+  return { shared_query_count: sharedCount, shared_impressions: sharedImpressions, shared_clicks: sharedClicks, shared_queries: topQueries };
 }
 
 function components(nodes, links) {
@@ -627,22 +658,29 @@ async function analyze(request, env) {
   const nodes = usable.map((d, i) => ({ id: i, url: d.url, title: d.title, type: 'page', chars: d.chars, template_chars_removed: d.template_chars_removed || 0, intent: intent[i].intent, intent_confidence: Number(intent[i].confidence) || 0, intent_evidence: intent[i].evidence || '', intent_source: intent[i].source, expected_role: intent[i].expected_role || 'unclear', expected_role_confidence: Number(intent[i].expected_role_confidence) || 0, expected_role_evidence: intent[i].expected_role_evidence || '', role_source: intent[i].role_source, role_fit: intent[i].role_fit || 'unclear', role_evidence: intent[i].role_evidence || '', depth_score: intent[i].depth_score, closest_entity: entity[i].name, closest_entity_type: entity[i].type, closest_entity_salience: entity[i].salience, entity_method: entity[i].method, text_excerpt: d.text.slice(0, 700) }));
   const explicitBrandTerms = Array.isArray(body.brand_terms) ? body.brand_terms.map(term => String(term).trim()).filter(Boolean) : [];
   const cannibalReport = buildCannibalisationReport(gscResult.cannibalRows || [], gscResult.queryTotals || new Map(), nodes, explicitBrandTerms, gscResult.queryOnlyError || '', gscResult.cannibal_start_date || shiftIsoDays(endDate, -27), gscResult.cannibal_end_date || endDate);
+  const rowsByPage = indexGscRowsByPage(rows), previousRowsByPage = indexGscRowsByPage(previousRows), recentRowsByPage = indexGscRowsByPage(recentRows);
+  const pageRowsByNode = nodes.map(node => [...(rowsByPage.get(normalizePage(node.url))?.values() || [])]);
   for (const node of nodes) {
-    const pageRows = rows.filter(r => r.page === normalizePage(node.url));
-    node.gsc_top_query = [...pageRows].sort((a, b) => b.impressions - a.impressions || b.clicks - a.clicks)[0]?.query || '';
+    const pageRows = pageRowsByNode[node.id];
+    node.gsc_top_query = pageRows.reduce((best, row) => !best || row.impressions > best.impressions || (row.impressions === best.impressions && row.clicks > best.clicks) ? row : best, null)?.query || '';
   }
   const ahrefsResult = await fetchAhrefsVolumes(nodes.map(node => node.gsc_top_query), env);
   for (const node of nodes) {
-    const pageRows = rows.filter(r => r.page === normalizePage(node.url));
-    node.search_console = rows.length ? { query_count: pageRows.length, clicks: pageRows.reduce((n, x) => n + x.clicks, 0), impressions: pageRows.reduce((n, x) => n + x.impressions, 0), top_queries: [...pageRows].sort((a, b) => b.impressions - a.impressions).slice(0, 3).map(x => ({ query: x.query, impressions: x.impressions, clicks: x.clicks, position: x.position })) } : null;
+    const pageRows = pageRowsByNode[node.id], topQueries = [];
+    for (const row of pageRows) {
+      topQueries.push(row);
+      topQueries.sort((a, b) => b.impressions - a.impressions);
+      if (topQueries.length > 3) topQueries.pop();
+    }
+    node.search_console = rows.length ? { query_count: pageRows.length, clicks: pageRows.reduce((n, x) => n + x.clicks, 0), impressions: pageRows.reduce((n, x) => n + x.impressions, 0), top_queries: topQueries.map(x => ({ query: x.query, impressions: x.impressions, clicks: x.clicks, position: x.position })) } : null;
     node.ahrefs_volume = ahrefsResult.byQuery.get(node.gsc_top_query.toLowerCase()) || { status: node.gsc_top_query ? (ahrefsResult.status === 'available' ? 'no-volume' : ahrefsResult.status) : 'no-gsc-query', keyword: node.gsc_top_query, volume: null, position: null, message: node.gsc_top_query ? (ahrefsResult.message || 'Ahrefs returned no volume for this query.') : 'No GSC query was available to look up.' };
   }
   const links = [], searchOverlaps = [];
+  const vectorNorms = vector.map(vectorNorm), embeddingNorms = embedded?.map(vectorNorm) || [];
   for (let i = 0; i < usable.length; i++) for (let j = i + 1; j < usable.length; j++) {
-    const searchEvidence = rows.length ? pairSharedQueries(usable[i], usable[j], rows) : null;
+    const searchEvidence = rows.length ? pairSharedQueries(usable[i], usable[j], rowsByPage) : null;
     if (searchEvidence?.shared_query_count) searchOverlaps.push({ source: i, target: j, ...searchEvidence });
-    let score;
-    if (embedded) { const a = Object.fromEntries(embedded[i].map((v, k) => [String(k), v])), b = Object.fromEntries(embedded[j].map((v, k) => [String(k), v])); score = cosine(a, b); } else score = cosine(vector[i], vector[j]);
+    const score = embedded ? cosine(embedded[i], embedded[j], embeddingNorms[i], embeddingNorms[j]) : cosine(vector[i], vector[j], vectorNorms[i], vectorNorms[j]);
     const sim = Math.round(Math.max(0, Math.min(1, score)) * 1000) / 10;
     if (sim < threshold) continue;
     const shared = keywords(vector[i], vector[j]);
@@ -654,7 +692,7 @@ async function analyze(request, env) {
       const other = nodes.find(candidate => candidate.id === otherId);
       return { other_title: other?.title || other?.url || 'Other page', other_url: other?.url || '', metrics: { shared_query_count: pair.shared_query_count, shared_impressions: pair.shared_impressions, shared_clicks: pair.shared_clicks, shared_queries: pair.shared_queries } };
     });
-    node.workbook = sheetInsights(node, pairRows, summarizePagePerformance(rows, usable[node.id]), summarizePagePerformance(previousRows, usable[node.id]), summarizePagePerformance(recentRows, usable[node.id]), node.ahrefs_volume);
+    node.workbook = sheetInsights(node, pairRows, summarizePagePerformance(rowsByPage, usable[node.id]), summarizePagePerformance(previousRowsByPage, usable[node.id]), summarizePagePerformance(recentRowsByPage, usable[node.id]), node.ahrefs_volume);
     const pageCannibalRows = cannibalReport.rows.filter(row => normalizeCannibalUrl(row.page) === normalizeCannibalUrl(node.url));
     if (pageCannibalRows.length) {
       const strongest = [...pageCannibalRows].sort((a, b) => b.query_total_impressions - a.query_total_impressions || b.impressions - a.impressions)[0];
