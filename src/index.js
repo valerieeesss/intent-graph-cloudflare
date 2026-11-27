@@ -292,6 +292,7 @@ function normalizePage(value) {
   try { const u = new URL(String(value)); return `${u.hostname.toLowerCase()}${u.pathname.replace(/\/+$/, '').toLowerCase() || '/'}`; }
   catch { return String(value || '').trim().replace(/[?#].*$/, '').replace(/\/+$/, '').toLowerCase(); }
 }
+function normalizeAhrefsPage(value) { return normalizePage(value).replace(/^www\./, ''); }
 function normalizedRows(rawRows, docs) {
   const allowed = new Set(docs.map(d => normalizePage(d.url)));
   return rawRows.map(row => {
@@ -302,6 +303,134 @@ function normalizedRows(rawRows, docs) {
     if (!allowed.has(key)) return null;
     return { page: key, query: String(query).trim(), clicks: number(field(row, /^clicks?$/i)), impressions: number(field(row, /^impressions?$/i)), ctr: number(field(row, /^ctr$/i)), position: number(field(row, /^(position|averageposition|avgposition)$/i)) };
   }).filter(x => x && x.query);
+}
+
+function shiftIsoMonths(value, amount) {
+  const [year, month, day] = value.split('-').map(Number);
+  const index = month - 1 + amount;
+  const targetYear = year + Math.floor(index / 12);
+  const targetMonth = ((index % 12) + 12) % 12;
+  const targetDay = Math.min(day, new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate());
+  return `${targetYear}-${String(targetMonth + 1).padStart(2, '0')}-${String(targetDay).padStart(2, '0')}`;
+}
+function shiftIsoDays(value, amount) { const date = new Date(`${value}T00:00:00Z`); date.setUTCDate(date.getUTCDate() + amount); return date.toISOString().slice(0, 10); }
+function summarizePagePerformance(rows, doc) {
+  const matching = rows.filter(row => row.page === normalizePage(doc.url));
+  return { clicks: matching.reduce((sum, row) => sum + row.clicks, 0), impressions: matching.reduce((sum, row) => sum + row.impressions, 0), queries: [...new Set(matching.map(row => row.query.toLowerCase()))].length };
+}
+function percentChange(current, previous) { return previous > 0 ? Math.round(((current - previous) / previous) * 1000) / 10 : null; }
+
+async function seoPerformanceRows(key, tool, site, startDate, endDate, sessionId, protocolVersion, docs, requestId) {
+  const args = makeToolArgs(tool, site, startDate, endDate);
+  const rpc = await mcpRpc(key, 'tools/call', { name: tool.name, arguments: args }, sessionId, requestId, protocolVersion);
+  return normalizedRows(findRows(decodeToolResult(rpc.result)), docs);
+}
+
+async function fetchAhrefsTopPages(docs, env, date) {
+  if (!env.AHREFS_API_KEY) return { status: 'not-configured', byPage: new Map(), message: 'AHREFS_API_KEY is not configured.', unitEstimate: null };
+  const groups = new Map();
+  for (const doc of docs) {
+    const host = new URL(doc.final_url).hostname.toLowerCase().replace(/^www\./, '');
+    if (!groups.has(host)) groups.set(host, []);
+    groups.get(host).push(doc);
+  }
+  const byPage = new Map();
+  const outcomes = await mapLimit([...groups.entries()], 3, async ([host, group]) => {
+    const targets = [...new Set(group.flatMap(doc => [doc.url, doc.final_url]))];
+    const where = { or: targets.map(target => ({ field: 'url', is: ['eq', target] })) };
+    const params = new URLSearchParams({
+      select: 'url,top_keyword,top_keyword_volume,top_keyword_best_position',
+      // The Site Explorer Top Pages endpoint requires a target alongside filters.
+      // Use the grouped host as the scope, then narrow to the submitted URLs below.
+      target: host,
+      where: JSON.stringify(where),
+      limit: '1000',
+      date,
+      country: 'au',
+      mode: 'subdomains',
+      protocol: 'both',
+      volume_mode: 'average',
+      output: 'json'
+    });
+    try {
+      const response = await fetch(`https://api.ahrefs.com/v3/site-explorer/top-pages?${params}`, { headers: { authorization: `Bearer ${env.AHREFS_API_KEY}`, accept: 'application/json' }, signal: AbortSignal.timeout(45000) });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(`Ahrefs API HTTP ${response.status}: ${String(body.error || body.message || '').slice(0, 180)}`);
+      const pages = Array.isArray(body.pages) ? body.pages : Array.isArray(body) ? body : [];
+      for (const page of pages) {
+        const key = normalizeAhrefsPage(page.url || page.raw_url);
+        if (key) byPage.set(key, { keyword: page.top_keyword || '', volume: page.top_keyword_volume == null ? null : number(page.top_keyword_volume), position: page.top_keyword_best_position == null ? null : number(page.top_keyword_best_position), status: page.top_keyword ? 'available' : 'no-keyword' });
+      }
+      return { status: 'available', host, rows: pages.length };
+    } catch (error) { return { status: 'unavailable', host, message: error.message.slice(0, 240) }; }
+  });
+  const failed = outcomes.filter(x => x.status === 'unavailable');
+  for (const group of groups.values()) for (const doc of group) {
+    const finalKey = normalizeAhrefsPage(doc.final_url), inputKey = normalizeAhrefsPage(doc.url);
+    const record = byPage.get(finalKey) || byPage.get(inputKey);
+    if (record) { byPage.set(normalizeAhrefsPage(doc.final_url), record); byPage.set(normalizeAhrefsPage(doc.url), record); }
+    else {
+      const host = new URL(doc.final_url).hostname.toLowerCase().replace(/^www\./, '');
+      const outcome = outcomes.find(item => item.host === host);
+      const fallback = outcome?.status === 'unavailable'
+        ? { status: 'unavailable', keyword: '', volume: null, position: null, message: outcome.message }
+        : { status: 'no-keyword', keyword: '', volume: null, position: null, message: 'Ahrefs returned no top keyword for this exact URL.' };
+      byPage.set(finalKey, fallback); byPage.set(inputKey, fallback);
+    }
+  }
+  const unitEstimate = [...groups.values()].reduce((sum, group) => sum + Math.max(50, group.length * 13), 0);
+  return { status: failed.length === outcomes.length ? 'unavailable' : 'available', byPage, message: failed.length ? failed.map(x => `${x.host}: ${x.message}`).join(' · ') : '', groups: outcomes.length, unitEstimate };
+}
+
+function sheetInsights(node, overlapping, page6, previous3, recent3, ahrefs) {
+  const tags = [], problems = [], actions = [];
+  if (overlapping.length) {
+    const queries = [...new Set(overlapping.flatMap(pair => pair.shared_queries.map(item => item.query)))];
+    const queryPairCount = overlapping.reduce((sum, pair) => sum + pair.shared_query_count, 0);
+    tags.push(`Cannibalisation (${queries.slice(0, 3).join(', ') || `${overlapping.length} page pair(s)`})`);
+    const competitors = [...new Set(overlapping.map(pair => pair.other_title))];
+    problems.push(`Has ${queryPairCount} shared query/page-pair matches with ${competitors.slice(0, 3).join('; ')} across the six-month window${queries.length ? `, including “${queries.slice(0, 3).join('”, “')}”` : ''}. This is a search-overlap signal, not proof that cannibalisation is harming rankings.`);
+    actions.push('Choose the intended owner for each shared query, then clarify each page’s role and add links that reinforce the preferred destination.');
+  }
+  if (node.role_fit && /mismatch|partial|unclear|misalign/i.test(node.role_fit)) {
+    tags.push('Intent mismatch');
+    problems.push(`The page’s content appears ${node.role_fit} against its expected ${node.expected_role || 'unclear'} role.`);
+    actions.push(`Align the opening section, headings, and calls to action with the intended ${node.expected_role || 'page'} role.`);
+  }
+  const clicksChange = percentChange(recent3.clicks, previous3.clicks);
+  if (clicksChange != null && clicksChange <= -20) {
+    tags.push(`Content decay (${Math.abs(clicksChange)}% clicks)`);
+    problems.push(`GSC clicks fell ${Math.abs(clicksChange)}% from ${previous3.clicks} in the earlier three months to ${recent3.clicks} in the latest three months.`);
+    actions.push('Review the declining queries and refresh the page where facts, examples, or guidance have become outdated.');
+  }
+  if (node.depth_score != null && Number(node.depth_score) < 60) {
+    tags.push('Role depth');
+    problems.push(`The semantic assessment scored role-specific depth at ${node.depth_score}/100.`);
+    actions.push('Add specific, role-relevant detail that answers the user’s next questions without repeating the site hub.');
+  }
+  if (!tags.length) {
+    problems.push('No strong intent mismatch, shared-query overlap, or six-month click decline was detected in the available data.');
+    actions.push('Keep the page aligned to its inferred role and monitor the next reporting period.');
+  }
+  const severity = tags.some(tag => tag.startsWith('Cannibalisation') || tag.startsWith('Content decay')) && (tags.includes('Intent mismatch') || (clicksChange != null && clicksChange <= -40)) ? 'High' : tags.length ? 'Medium' : 'No';
+  const intent = node.intent || 'unclear';
+  const role = node.expected_role || 'unclear';
+  const keywordEvidence = ahrefs?.keyword ? `; Ahrefs top keyword “${ahrefs.keyword}”${ahrefs.position == null ? '' : ` (#${ahrefs.position})`}${ahrefs.volume == null ? '' : `, volume ${ahrefs.volume}`}` : '';
+  const ownership = `${intent} intent on ${role} page; role fit: ${node.role_fit || 'unclear'}${keywordEvidence}${node.intent_evidence ? `; evidence: “${node.intent_evidence}”` : ''}`;
+  return {
+    page_type: role,
+    current_intent_ownership: ownership,
+    problem: problems.join(' '),
+    optimisation_needed: severity === 'No' ? 'No' : `Yes – ${severity}`,
+    issue_tags: tags.join(', ') || 'None detected',
+    recommended_action: actions.join(' '),
+    gsc_six_months: page6,
+    gsc_previous_three_months: previous3,
+    gsc_recent_three_months: recent3,
+    gsc_click_change_percent: clicksChange,
+    cannibalisation: overlapping.map(pair => ({ title: pair.other_title, url: pair.other_url, ...pair.metrics })),
+    ahrefs: ahrefs || { status: 'not-found', keyword: '', volume: null, position: null }
+  };
 }
 
 function localRoleDescription(slug) { return slug.replace(/[-_]+/g, ' ').trim(); }
@@ -331,7 +460,7 @@ async function handle(request, env) {
   if (url.pathname.startsWith('/api/')) {
     const origin = request.headers.get('origin');
     if (origin && origin !== url.origin) return json({ error: 'Cross-origin request blocked.' }, 403);
-    if (request.method === 'GET' && url.pathname === '/api/config') return json({ google_cloud_project: env.GOOGLE_CLOUD_PROJECT || '', google_cloud_configured: Boolean(env.GOOGLE_SERVICE_ACCOUNT_JSON), seogets_configured: Boolean(env.SEOGETS_API_KEY), claude_configured: Boolean(env.ANTHROPIC_API_KEY) });
+    if (request.method === 'GET' && url.pathname === '/api/config') return json({ google_cloud_project: env.GOOGLE_CLOUD_PROJECT || '', google_cloud_configured: Boolean(env.GOOGLE_SERVICE_ACCOUNT_JSON), seogets_configured: Boolean(env.SEOGETS_API_KEY), ahrefs_configured: Boolean(env.AHREFS_API_KEY), claude_configured: Boolean(env.ANTHROPIC_API_KEY) });
     if (request.method === 'POST' && url.pathname === '/api/seogets/sites') return listSeoGetsSites(env);
     if (request.method === 'POST' && url.pathname === '/api/analyze') return analyze(request, env);
     if (request.method === 'GET' && url.pathname === '/api/health') return json({ ok: true });
@@ -387,21 +516,21 @@ async function analyze(request, env) {
   let embedded;
   try { embedded = await vertexEmbeddings(usable, cloudToken, env); }
   catch (e) { return json({ error: e.message.slice(0, 300) }, 502); }
-  const vector = vectors(usable), intent = await claudeAnalysis(usable, env), entity = await entities(usable, cloudToken, env, googleAuthError);
+  const vector = vectors(usable);
+  const [intent, entity, ahrefsResult] = await Promise.all([claudeAnalysis(usable, env), entities(usable, cloudToken, env, googleAuthError), fetchAhrefsTopPages(usable, env, endDate)]);
   const nodes = usable.map((d, i) => ({ id: i, url: d.url, title: d.title, type: 'page', chars: d.chars, template_chars_removed: d.template_chars_removed || 0, intent: intent[i].intent, intent_confidence: Number(intent[i].confidence) || 0, intent_evidence: intent[i].evidence || '', intent_source: intent[i].source, expected_role: intent[i].expected_role || 'unclear', expected_role_confidence: Number(intent[i].expected_role_confidence) || 0, expected_role_evidence: intent[i].expected_role_evidence || '', role_source: intent[i].role_source, role_fit: intent[i].role_fit || 'unclear', role_evidence: intent[i].role_evidence || '', depth_score: intent[i].depth_score, closest_entity: entity[i].name, closest_entity_type: entity[i].type, closest_entity_salience: entity[i].salience, entity_method: entity[i].method, text_excerpt: d.text.slice(0, 700) }));
 
-  let rows = [], gscStatus = { method: 'SEO Gets MCP', status: 'not-connected', site, start_date: startDate, end_date: endDate, rows: 0, truncated: false, message: 'Enter an SEO Gets site and date range to add query-overlap evidence.' };
+  let rows = [], previousRows = [], recentRows = [], gscStatus = { method: 'SEO Gets MCP', status: 'not-connected', site, start_date: startDate, end_date: endDate, rows: 0, truncated: false, message: 'SEO Gets query data was not available.' };
   if (site && env.SEOGETS_API_KEY) {
     try {
       const { tools, sessionId, protocolVersion } = await openMcp(env.SEOGETS_API_KEY);
       const tool = tools.find(t => t.name === GSC_TOOL);
       if (!tool) throw new Error(`SEO Gets does not expose the read-only ${GSC_TOOL} tool.`);
-      const args = makeToolArgs(tool, site, startDate, endDate);
-      const rpc = await mcpRpc(env.SEOGETS_API_KEY, 'tools/call', { name: GSC_TOOL, arguments: args }, sessionId, 4, protocolVersion);
-      const decoded = decodeToolResult(rpc.result);
-      const rawRows = findRows(decoded);
-      rows = normalizedRows(rawRows, usable);
-      gscStatus = { method: 'SEO Gets MCP / get_site_performance', status: rows.length ? 'available' : 'no-matching-rows', site, start_date: startDate, end_date: endDate, rows: rawRows.length, matched_rows: rows.length, truncated: rawRows.length >= 50000, message: rows.length ? 'Search performance rows loaded; shared-query totals are computed from returned page/query rows.' : 'SEO Gets returned no page/query rows matching the input URLs. Check the property, date range, and canonical URLs.' };
+      const halfStart = shiftIsoMonths(endDate, -3), firstEnd = shiftIsoDays(halfStart, -1);
+      rows = await seoPerformanceRows(env.SEOGETS_API_KEY, tool, site, startDate, endDate, sessionId, protocolVersion, usable, 4);
+      previousRows = await seoPerformanceRows(env.SEOGETS_API_KEY, tool, site, startDate, firstEnd, sessionId, protocolVersion, usable, 5);
+      recentRows = await seoPerformanceRows(env.SEOGETS_API_KEY, tool, site, halfStart, endDate, sessionId, protocolVersion, usable, 6);
+      gscStatus = { method: 'SEO Gets MCP / get_site_performance', status: rows.length ? 'available' : 'no-matching-rows', site, start_date: startDate, end_date: endDate, rows: rows.length, truncated: rows.length >= 50000, message: rows.length ? 'Six-month page/query performance retrieved. Shared queries flag possible cannibalisation; clicks compare the first and latest three months for decay signals.' : 'SEO Gets returned no page/query rows matching the input URLs. Check the property, date range, and canonical URLs.' };
     } catch (e) { gscStatus = { ...gscStatus, status: 'unavailable', message: e.message.slice(0, 300) }; }
   } else if (site) {
     gscStatus = { ...gscStatus, status: 'unavailable', message: 'SEOGETS_API_KEY is not configured in the Worker.' };
@@ -422,11 +551,19 @@ async function analyze(request, env) {
     const shared = keywords(vector[i], vector[j]);
     links.push({ source: i, target: j, similarity: sim, risk: sim >= 75 ? 'High' : 'Review', shared_topics: shared, source_evidence: snippet(usable[i].text, shared), target_evidence: snippet(usable[j].text, shared), same_intent: intent[i].intent === intent[j].intent, search_evidence: searchEvidence });
   }
+  for (const node of nodes) {
+    const pairRows = searchOverlaps.filter(pair => pair.source === node.id || pair.target === node.id).map(pair => {
+      const otherId = pair.source === node.id ? pair.target : pair.source;
+      const other = nodes.find(candidate => candidate.id === otherId);
+      return { other_title: other?.title || other?.url || 'Other page', other_url: other?.url || '', metrics: { shared_query_count: pair.shared_query_count, shared_impressions: pair.shared_impressions, shared_clicks: pair.shared_clicks, shared_queries: pair.shared_queries } };
+    });
+    node.workbook = sheetInsights(node, pairRows, summarizePagePerformance(rows, usable[node.id]), summarizePagePerformance(previousRows, usable[node.id]), summarizePagePerformance(recentRows, usable[node.id]), ahrefsResult.byPage.get(normalizeAhrefsPage(node.url)) || { status: ahrefsResult.status, keyword: '', volume: null, position: null, message: ahrefsResult.message });
+  }
   const groups = components(nodes, links);
   for (let i = 0; i < groups.length; i++) for (const id of groups[i]) { nodes[id].cluster = i + 1; nodes[id].cluster_name = keywords(vector[groups[i][0]], vector[groups[i].at(-1)], 3).join(', ') || 'Related pages'; }
   for (const n of nodes) { n.cluster ||= 0; n.cluster_name ||= 'No detected overlap'; }
   const intents = [...new Set(intent.map(x => x.source))];
-  return json({ result: { nodes, links, search_overlaps: searchOverlaps, errors, threshold, similarity_method: embedded ? 'Vertex AI text embeddings' : 'Local TF-IDF text similarity', cleanup_method: 'Main-content extraction, DOM chrome removal, and repeated same-site block removal', intent_method: intents.length === 1 ? intents[0] : 'Claude + local fallback', entity_method: [...new Set(entity.map(x => x.method))].join('; '), clusters: groups.map((g, i) => ({ id: i + 1, size: g.length })), created_at: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC', search_evidence: gscStatus } });
+  return json({ result: { nodes, links, search_overlaps: searchOverlaps, errors, threshold, similarity_method: embedded ? 'Vertex AI text embeddings' : 'Local TF-IDF text similarity', cleanup_method: 'Main-content extraction, DOM chrome removal, and repeated same-site block removal', intent_method: intents.length === 1 ? intents[0] : 'Claude + local fallback', entity_method: [...new Set(entity.map(x => x.method))].join('; '), clusters: groups.map((g, i) => ({ id: i + 1, size: g.length })), created_at: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC', search_evidence: gscStatus, ahrefs_evidence: { status: ahrefsResult.status, message: ahrefsResult.message, country: 'AU', date: endDate, groups: ahrefsResult.groups || 0 }, ahrefs_unit_estimate: ahrefsResult.unitEstimate, report_method: { gsc_window: 'Six months, compared as earlier three months vs latest three months', decay_threshold: 'Click decline of 20% or more is tagged for review; this is a triage signal, not proof of cause.', cannibalisation_method: 'At least one query appears for two or more submitted pages in the six-month GSC data.', ahrefs_method: 'Top Pages report, exact submitted URL filter, Australian database, average volume mode.' } } });
 }
 
 export default { fetch: handle };

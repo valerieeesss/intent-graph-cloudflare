@@ -36,7 +36,7 @@
       <div class="threshold-control"><label for="threshold">Show matches from <strong><span id="threshold-value">85</span>%</strong></label><input id="threshold" type="range" min="10" max="90" value="85"><div class="range-labels"><span>More connections</span><span>Stronger matches</span></div></div>
         <button id="analyze" class="primary-button" type="button"><span>Build my graph</span><span class="button-arrow">→</span></button>
       </div>
-      <p class="privacy-note">Pages are fetched for analysis. Claude reads the extracted page text and URL slug. Google Cloud analysis and SEO Gets verification run automatically when configured.</p>
+      <p class="privacy-note">Pages are fetched for analysis. Claude reads the extracted page text and URL slug. Google Cloud and six-month SEO Gets data run automatically; Ahrefs keyword data is added when configured. Download the graph or an Excel report.</p>
     </section>
 
     <section class="progress-card hidden" id="progress-card" aria-live="polite">
@@ -45,7 +45,7 @@
     </section>
 
     <section class="result-card hidden" id="result-card">
-      <div class="result-head"><div><div class="eyebrow">YOUR ANALYSIS</div><h2>Graph is ready</h2></div><a id="download-link" download class="primary-button download-button" href="#"><span>Download HTML</span><span class="button-arrow">↓</span></a></div>
+      <div class="result-head"><div><div class="eyebrow">YOUR ANALYSIS</div><h2>Graph is ready</h2></div><div class="download-actions"><a id="download-link" download class="primary-button download-button" href="#"><span>Download HTML</span><span class="button-arrow">↓</span></a><button id="download-excel" class="secondary-button" type="button">Download Excel</button></div></div>
       <div class="result-stats" id="result-stats"></div>
       <div class="result-method" id="result-method"></div>
       <div class="error-list hidden" id="error-list"></div>
@@ -56,6 +56,7 @@
     <section class="how-grid"><article><span>01 / READ</span><h3>Pages, not URL guesses</h3><p>The app extracts readable text from each page before comparing anything.</p></article><article><span>02 / COMPARE</span><h3>Cleaned similarity with evidence</h3><p>Repeated navigation, footer, and same-site template text is filtered before matching and evidence selection.</p></article><article><span>03 / UNDERSTAND</span><h3>Intent in context</h3><p>Claude infers expected role from the URL slug, then checks current intent and role depth against the fetched page text.</p></article></section>
     <footer><span>PAGEGRAPH · EARLY ACCESS</span><span>Analysis is a signal for review, not an automatic content decision.</span></footer>
   </main>
+  <script src="/xlsx.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

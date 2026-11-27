@@ -1,6 +1,7 @@
 const $=s=>document.querySelector(s);
 const urlList=$('#url-list'),csvFile=$('#csv-file'),analyzeButton=$('#analyze');
 let reportBlob=null,seogetsChoices=[],seoSitesPromise=Promise.resolve(),seoSitesError='';
+const analysisConfigPromise=api('/api/config').catch(()=>({}));
 
 async function api(path,body){
   const options={method:body===undefined?'GET':'POST',headers:{}};
@@ -11,6 +12,8 @@ async function api(path,body){
 }
 
 function localDate(d){return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
+function sixMonthsAgo(from){const month=from.getMonth()-6,year=from.getFullYear()+Math.floor(month/12),targetMonth=(month%12+12)%12;return new Date(year,targetMonth,Math.min(from.getDate(),new Date(year,targetMonth+1,0).getDate()))}
+function estimatedAhrefsUnits(urls){const groups=new Map();for(const url of urls){try{const host=new URL(url).hostname.toLowerCase().replace(/^www\./,'');groups.set(host,(groups.get(host)||0)+1)}catch{}}return [...groups.values()].reduce((sum,count)=>sum+Math.max(50,count*13),0)}
 
 function countUrls(){const count=urlList.value.split(/\r?\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#')).length;$('#url-count').textContent=`${count} URL${count===1?'':'s'}`}
 urlList.addEventListener('input',countUrls);$('#clear-urls').addEventListener('click',()=>{urlList.value='';countUrls()});
@@ -34,9 +37,11 @@ async function beginAnalysis(){
   if(analyzeButton.disabled)return;
   const urls=urlList.value.split(/\r?\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#'));
   if(csvFile.files[0])try{urls.push(...parseCsv(await csvFile.files[0].text()))}catch{showError('Could not read the CSV file.');return}
+  const config=await analysisConfigPromise;
+  if(config.ahrefs_configured){const estimate=estimatedAhrefsUnits(urls);if(!window.confirm(`This run will request Ahrefs top-keyword data. Estimated minimum: about ${estimate.toLocaleString()} API units for ${urls.length} pages. Actual usage depends on returned rows and Ahrefs pricing. Continue?`))return}
   $('#progress-card').classList.remove('hidden');$('#result-card').classList.add('hidden');$('#progress-title').textContent='Reading and comparing your pages…';$('#progress-phase').textContent=`Submitting ${urls.length} URLs`;$('#progress-percent').textContent='0%';$('#progress-fill').style.width='0%';analyzeButton.disabled=true;
   await seoSitesPromise;const site=autoSelectSeoSite(urls);if(!site){showError(seoSitesError||'Could not automatically match these URLs to an SEO Gets property. Check that they belong to a property in the connected SEO Gets account.');return}
-  const end=new Date(),start=new Date();start.setDate(start.getDate()-90);
+  const end=new Date(),start=sixMonthsAgo(end);
   try{const data=await api('/api/analyze',{urls,threshold:Number($('#threshold').value),seogets_site:site,start_date:localDate(start),end_date:localDate(end)});$('#progress-percent').textContent='100%';$('#progress-fill').style.width='100%';$('#progress-phase').textContent='Report ready';await showResult(data.result)}catch(e){showError(e.message)}
 }
 
@@ -47,9 +52,11 @@ async function showResult(data){
   const stats=[['',data.nodes.length,'Pages read'],['',data.links.length,'Content overlaps'],['',data.clusters.length,'Clusters'],['',high,'Strong matches'],['',shared,'Content pairs sharing queries'],['',(data.search_overlaps||[]).length,'Search overlap pairs']];
   $('#result-stats').innerHTML=stats.map(s=>`<div class="stat-pill"><strong>${s[1]}</strong><span>${s[2]}</span></div>`).join('');
   const se=data.search_evidence||{};
-  $('#result-method').textContent=`Similarity: ${data.similarity_method}. Page role and intent: ${data.intent_method}. Closest entity: ${data.entity_method}. Cutoff: ${data.threshold}%. Search evidence: ${se.status||'not available'}${se.site?` for ${se.site}, ${se.start_date} to ${se.end_date}`:''}. ${se.message||''}`;
+  const ah=data.ahrefs_evidence||{};
+  $('#result-method').textContent=`Similarity: ${data.similarity_method}. Page role and intent: ${data.intent_method}. Closest entity: ${data.entity_method}. Cutoff: ${data.threshold}%. SEO Gets six-month evidence: ${se.status||'not available'}${se.site?` for ${se.site}, ${se.start_date} to ${se.end_date}`:''}. Ahrefs: ${ah.status||'not available'}${ah.message?` — ${ah.message}`:''}. ${se.message||''}`;
   const errors=$('#error-list');if(data.errors?.length){errors.classList.remove('hidden');errors.innerHTML=`<strong>${data.errors.length} page${data.errors.length===1?'':'s'} could not be read</strong>`+data.errors.map(e=>`<div><code>${esc(e.url)}</code> — ${esc(e.error)}</div>`).join('')}else errors.classList.add('hidden');
   const template=await fetch('/graph.html').then(r=>r.text());const payload=JSON.stringify(data).replace(/</g,'\\u003c').replace(/\u2028/g,'\\u2028').replace(/\u2029/g,'\\u2029');const html=template.replace('/*__DATA__*/null',`/*__DATA__*/${payload}`);$('#graph-frame').srcdoc=html;reportBlob=new Blob([html],{type:'text/html'});$('#download-link').onclick=e=>{e.preventDefault();if(!reportBlob)return;const link=document.createElement('a');link.href=URL.createObjectURL(reportBlob);link.download=`intent-graph-${new Date().toISOString().slice(0,10)}.html`;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),30000)};
+  $('#download-excel').onclick=()=>{const bytes=window.IntentGraphWorkbook.create(data),blob=new Blob([bytes],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}),link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download=`intent-graph-results-${new Date().toISOString().slice(0,10)}.xlsx`;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),30000)};
   $('#result-card').scrollIntoView({behavior:'smooth',block:'start'});
 }
 
