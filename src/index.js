@@ -1,5 +1,3 @@
-const MCP_URL = "https://app.seogets.com/mcp";
-const GSC_TOOL = "get_site_performance";
 const STOP_WORDS = new Set("a an the and or but if then than of to in on at by for from with as is are was were be been being it its this that these those we you your our their they them he she his her i me my do does did can could would should will may might about into over under between across page pages website content business guide learn find get apply application click more read use using used including include details information help also one two not all any each when where what how why who which while".split(" "));
 const TOKEN_RE = /[a-z][a-z0-9'-]{2,}/gi;
 
@@ -145,6 +143,97 @@ function base64Url(value) {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
+function fromBase64Url(value) {
+  const base64 = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+  return Uint8Array.from(atob(base64 + '='.repeat((4 - base64.length % 4) % 4)), c => c.charCodeAt(0));
+}
+function requestCookie(request, name) {
+  const item = (request.headers.get('cookie') || '').split(';').map(x => x.trim()).find(x => x.startsWith(`${name}=`));
+  return item ? item.slice(name.length + 1) : '';
+}
+function cookieHeader(name, value, maxAge) {
+  return `${name}=${value}; Path=/; Secure; HttpOnly; SameSite=Lax${maxAge == null ? '' : `; Max-Age=${maxAge}`}`;
+}
+function clearCookieHeader(name) { return `${name}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`; }
+const GSC_TOKEN_COOKIE = '__Host-intent-gsc';
+const GSC_STATE_COOKIE = '__Host-intent-gsc-state';
+const GSC_READ_SCOPE = 'https://www.googleapis.com/auth/webmasters.readonly';
+
+async function cookieEncryptionKey(secret) {
+  if (!secret) throw new Error('Google OAuth client secret is not configured.');
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret));
+  return crypto.subtle.importKey('raw', digest, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+}
+async function encryptCookieValue(value, secret) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await cookieEncryptionKey(secret);
+  const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(value)));
+  const combined = new Uint8Array(iv.length + ciphertext.length); combined.set(iv); combined.set(ciphertext, iv.length);
+  return base64Url(combined);
+}
+async function decryptCookieValue(value, secret) {
+  if (!value) return '';
+  try {
+    const combined = fromBase64Url(value), iv = combined.slice(0, 12), ciphertext = combined.slice(12);
+    const key = await cookieEncryptionKey(secret);
+    const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+    return new TextDecoder().decode(plaintext);
+  } catch { return ''; }
+}
+function oauthRedirect(request, status) {
+  const target = new URL('/', request.url); target.searchParams.set('google', status);
+  return Response.redirect(target.toString(), 303);
+}
+async function beginGoogleOAuth(request, env) {
+  if (!env.GOOGLE_OAUTH_CLIENT_ID || !env.GOOGLE_OAUTH_CLIENT_SECRET) return new Response('Google Search Console sign-in is not fully configured in Cloudflare.', { status: 503 });
+  const url = new URL(request.url), stateBytes = crypto.getRandomValues(new Uint8Array(32)), state = base64Url(stateBytes), remember = url.searchParams.get('remember') === '1';
+  const redirectUri = new URL('/api/google/callback', url).toString();
+  const authorize = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+  authorize.search = new URLSearchParams({ client_id: env.GOOGLE_OAUTH_CLIENT_ID, redirect_uri: redirectUri, response_type: 'code', scope: GSC_READ_SCOPE, access_type: 'offline', include_granted_scopes: 'true', prompt: 'consent', state }).toString();
+  return new Response(null, { status: 302, headers: { location: authorize.toString(), 'set-cookie': cookieHeader(GSC_STATE_COOKIE, `${state}.${remember ? '1' : '0'}`, 600), 'cache-control': 'no-store' } });
+}
+async function finishGoogleOAuth(request, env) {
+  const url = new URL(request.url), rawState = requestCookie(request, GSC_STATE_COOKIE), [expectedState, rememberFlag] = rawState.split('.');
+  const headers = new Headers({ 'set-cookie': clearCookieHeader(GSC_STATE_COOKIE), 'cache-control': 'no-store' });
+  if (!expectedState || expectedState !== url.searchParams.get('state')) return oauthRedirect(request, 'error');
+  if (url.searchParams.has('error') || !url.searchParams.get('code')) return oauthRedirect(request, 'error');
+  try {
+    const redirectUri = new URL('/api/google/callback', url).toString();
+    const response = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ code: url.searchParams.get('code'), client_id: env.GOOGLE_OAUTH_CLIENT_ID, client_secret: env.GOOGLE_OAUTH_CLIENT_SECRET, redirect_uri: redirectUri, grant_type: 'authorization_code' }), signal: AbortSignal.timeout(30000) });
+    const tokens = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(tokens.error_description || tokens.error || 'Google token exchange failed.');
+    let refreshToken = tokens.refresh_token || '';
+    if (!refreshToken) {
+      const previous = await decryptCookieValue(requestCookie(request, GSC_TOKEN_COOKIE), env.GOOGLE_OAUTH_CLIENT_SECRET);
+      try { refreshToken = JSON.parse(previous).refresh_token || ''; } catch {}
+    }
+    if (!refreshToken) throw new Error('Google did not return a refresh token. Disconnect this app from your Google Account and connect again.');
+    const encrypted = await encryptCookieValue(JSON.stringify({ refresh_token: refreshToken }), env.GOOGLE_OAUTH_CLIENT_SECRET);
+    headers.append('set-cookie', cookieHeader(GSC_TOKEN_COOKIE, encrypted, rememberFlag === '1' ? 30 * 24 * 60 * 60 : null));
+    const target = new URL('/', url); target.searchParams.set('google', 'connected');
+    headers.set('location', target.toString());
+    return new Response(null, { status: 303, headers });
+  } catch {
+    const target = new URL('/', url); target.searchParams.set('google', 'error');
+    headers.set('location', target.toString());
+    return new Response(null, { status: 303, headers });
+  }
+}
+async function googleOAuthStatus(request, env) {
+  const saved = await decryptCookieValue(requestCookie(request, GSC_TOKEN_COOKIE), env.GOOGLE_OAUTH_CLIENT_SECRET);
+  let connected = false; try { connected = Boolean(JSON.parse(saved).refresh_token); } catch {}
+  return json({ configured: Boolean(env.GOOGLE_OAUTH_CLIENT_ID && env.GOOGLE_OAUTH_CLIENT_SECRET), connected });
+}
+async function googleSearchConsoleAccessToken(request, env) {
+  const saved = await decryptCookieValue(requestCookie(request, GSC_TOKEN_COOKIE), env.GOOGLE_OAUTH_CLIENT_SECRET);
+  let refreshToken = ''; try { refreshToken = JSON.parse(saved).refresh_token || ''; } catch {}
+  if (!refreshToken) throw new Error('Connect Google Search Console before running an analysis.');
+  const response = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: env.GOOGLE_OAUTH_CLIENT_ID, client_secret: env.GOOGLE_OAUTH_CLIENT_SECRET, refresh_token: refreshToken, grant_type: 'refresh_token' }), signal: AbortSignal.timeout(30000) });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || !result.access_token) throw new Error(result.error_description || 'Google sign-in expired. Connect Search Console again.');
+  return result.access_token;
+}
+
 async function googleCloudAccessToken(env) {
   if (!env.GOOGLE_SERVICE_ACCOUNT_JSON) return null;
   if (googleTokenCache && googleTokenCache.expiresAt > Date.now() + 60000) return googleTokenCache.token;
@@ -196,115 +285,11 @@ async function entities(docs, token, env, authError = '') {
   });
 }
 
-async function mcpRpc(key, method, params, sessionId, id = 1, protocolVersion = '2025-03-26') {
-  const headers = { authorization: `Bearer ${key}`, accept: 'application/json, text/event-stream', 'content-type': 'application/json' };
-  if (method !== 'initialize') headers['MCP-Protocol-Version'] = protocolVersion;
-  if (sessionId) headers['Mcp-Session-Id'] = sessionId;
-  const message = { jsonrpc: '2.0', method, ...(id === null ? {} : { id }), ...(params ? { params } : {}) };
-  const r = await fetch(MCP_URL, { method: 'POST', headers, body: JSON.stringify(message), signal: AbortSignal.timeout(60000) });
-  const nextSession = r.headers.get('mcp-session-id') || sessionId;
-  if (!r.ok) throw new Error(`SEO Gets MCP HTTP ${r.status}: ${(await r.text()).slice(0, 250)}`);
-  const type = r.headers.get('content-type') || '';
-  if (r.status === 202 || r.status === 204) return { result: null, sessionId: nextSession };
-  const text = await r.text();
-  let parsed;
-  if (type.includes('text/event-stream')) {
-    const packets = text.split(/\n\n/).flatMap(event => event.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trim())).filter(Boolean);
-    parsed = packets.map(x => { try { return JSON.parse(x); } catch { return null; } }).filter(Boolean).at(-1);
-  } else { try { parsed = JSON.parse(text); } catch { throw new Error('SEO Gets returned an unreadable MCP response.'); } }
-  if (!parsed) throw new Error('SEO Gets returned an empty MCP response.');
-  if (parsed.error) throw new Error(parsed.error.message || 'SEO Gets MCP error.');
-  return { result: parsed.result, sessionId: nextSession };
-}
-
-async function openMcp(key) {
-  const init = await mcpRpc(key, 'initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'intent-graph', version: '0.1.0' } }, null, 1);
-  const protocolVersion = init.result?.protocolVersion || '2025-03-26';
-  await mcpRpc(key, 'notifications/initialized', undefined, init.sessionId, null, protocolVersion).catch(() => {});
-  const listed = await mcpRpc(key, 'tools/list', {}, init.sessionId, 3, protocolVersion);
-  return { tools: listed.result?.tools || [], sessionId: listed.sessionId || init.sessionId, protocolVersion };
-}
-
-function decodeToolResult(result) {
-  if (result?.structuredContent) return result.structuredContent;
-  const texts = (result?.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n');
-  if (!texts) return result;
-  for (const candidate of [texts, texts.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1], texts.match(/\{[\s\S]*\}|\[[\s\S]*\]/)?.[0]]) {
-    if (!candidate) continue;
-    try { return JSON.parse(candidate); } catch {}
-  }
-  const lines = texts.split(/\r?\n/).filter(x => /^\s*\|/.test(x));
-  if (lines.length >= 3) {
-    const headers = lines[0].split('|').slice(1, -1).map(x => x.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_'));
-    return { rows: lines.slice(2).map(line => Object.fromEntries(line.split('|').slice(1, -1).map((v, i) => [headers[i], v.trim()]))) };
-  }
-  return { text: texts };
-}
-
-function makeToolArgs(tool, site, startDate, endDate) {
-  const schema = tool.inputSchema || {}, props = schema.properties || {}, required = schema.required || [], args = {};
-  for (const [key, p] of Object.entries(props)) {
-    const k = key.toLowerCase(), desc = String(p.description || '').toLowerCase();
-    if (/(site|property|domain)/.test(k) && (p.type === 'string' || !p.type)) args[key] = site;
-    else if (/(start|from).*(date)|^(start_date|date_from)$/.test(k)) args[key] = startDate;
-    else if (/(end|to).*(date)|^(end_date|date_to)$/.test(k)) args[key] = endDate;
-    else if (/date.?range|period/.test(k) && p.type === 'string') {
-      const en = p.enum || [];
-      if (en.includes('custom')) args[key] = 'custom';
-      else if (en.includes('last_3_months')) args[key] = 'last_3_months';
-      else if (en.includes('last_90_days')) args[key] = 'last_90_days';
-    } else if (/(dimension|group.?by|breakdown)/.test(k)) {
-      const values = p.items?.enum || p.enum || [];
-      const page = values.find(v => String(v).toLowerCase() === 'page');
-      const query = values.find(v => String(v).toLowerCase() === 'query');
-      if (p.type === 'array') args[key] = [page || 'page', query || 'query'];
-      else if (values.some(v => String(v).toLowerCase() === 'page,query')) args[key] = values.find(v => String(v).toLowerCase() === 'page,query');
-      else if (values.some(v => String(v).toLowerCase() === 'query,page')) args[key] = values.find(v => String(v).toLowerCase() === 'query,page');
-      else if (p.type === 'string') args[key] = 'page,query';
-    } else if (/(limit|rows|page_size)/.test(k) && p.type === 'integer') args[key] = Math.min(Number(p.maximum) || 50000, 50000);
-    else if (/start_row|offset/.test(k) && p.type === 'integer') args[key] = 0;
-    else if (/search_type|searchtype/.test(k) && p.type === 'string') args[key] = (p.enum || ['web']).find(v => String(v).toLowerCase() === 'web') || 'web';
-    else if (required.includes(key) && /site|property|domain/.test(desc)) args[key] = site;
-  }
-  const missing = required.filter(key => !(key in args));
-  if (missing.length) throw new Error(`SEO Gets requires fields this app cannot infer (${missing.join(', ')}).`);
-  return args;
-}
-
-function findRows(value, found = []) {
-  if (!value) return found;
-  if (Array.isArray(value)) {
-    if (value.length && value.every(x => x && typeof x === 'object') && value.some(x => Object.keys(x).some(k => /page|url|query|keyword/i.test(k)))) found.push(...value);
-    else for (const v of value) findRows(v, found);
-  } else if (typeof value === 'object') {
-    if (Array.isArray(value.rows)) findRows(value.rows, found);
-    else if (Array.isArray(value.data)) findRows(value.data, found);
-    else if (Array.isArray(value.results)) findRows(value.results, found);
-    else if (Array.isArray(value.items)) findRows(value.items, found);
-    else for (const v of Object.values(value)) findRows(v, found);
-  }
-  return found;
-}
-
-function field(row, re) { const key = Object.keys(row).find(k => re.test(k.toLowerCase().replace(/[^a-z0-9]/g, ''))); return key ? row[key] : undefined; }
 function number(value) { const n = Number(String(value ?? 0).replace(/[,%$]/g, '')); return Number.isFinite(n) ? n : 0; }
 function normalizePage(value) {
   try { const u = new URL(String(value)); return `${u.hostname.toLowerCase()}${u.pathname.replace(/\/+$/, '').toLowerCase() || '/'}`; }
   catch { return String(value || '').trim().replace(/[?#].*$/, '').replace(/\/+$/, '').toLowerCase(); }
 }
-function normalizeAhrefsPage(value) { return normalizePage(value).replace(/^www\./, ''); }
-function normalizedRows(rawRows, docs) {
-  const allowed = new Set(docs.map(d => normalizePage(d.url)));
-  return rawRows.map(row => {
-    const page = field(row, /^(page|url|landingpage|pageurl|canonicalurl)$/i);
-    const query = field(row, /^(query|keyword|searchquery|searchterm)$/i);
-    if (!page || !query) return null;
-    const key = normalizePage(page);
-    if (!allowed.has(key)) return null;
-    return { page: key, query: String(query).trim(), clicks: number(field(row, /^clicks?$/i)), impressions: number(field(row, /^impressions?$/i)), ctr: number(field(row, /^ctr$/i)), position: number(field(row, /^(position|averageposition|avgposition)$/i)) };
-  }).filter(x => x && x.query);
-}
-
 function shiftIsoMonths(value, amount) {
   const [year, month, day] = value.split('-').map(Number);
   const index = month - 1 + amount;
@@ -320,66 +305,188 @@ function summarizePagePerformance(rows, doc) {
 }
 function percentChange(current, previous) { return previous > 0 ? Math.round(((current - previous) / previous) * 1000) / 10 : null; }
 
-async function seoPerformanceRows(key, tool, site, startDate, endDate, sessionId, protocolVersion, docs, requestId) {
-  const args = makeToolArgs(tool, site, startDate, endDate);
-  const rpc = await mcpRpc(key, 'tools/call', { name: tool.name, arguments: args }, sessionId, requestId, protocolVersion);
-  return normalizedRows(findRows(decodeToolResult(rpc.result)), docs);
-}
-
-async function fetchAhrefsTopPages(docs, env, date) {
-  if (!env.AHREFS_API_KEY) return { status: 'not-configured', byPage: new Map(), message: 'AHREFS_API_KEY is not configured.', unitEstimate: null };
-  const groups = new Map();
-  for (const doc of docs) {
-    const host = new URL(doc.final_url).hostname.toLowerCase().replace(/^www\./, '');
-    if (!groups.has(host)) groups.set(host, []);
-    groups.get(host).push(doc);
+function gscPropertyScore(siteUrl, pageUrl) {
+  const site = String(siteUrl || '').trim(), page = String(pageUrl || '').trim();
+  if (site.startsWith('sc-domain:')) {
+    try { const host = new URL(page).hostname.toLowerCase().replace(/^www\./, ''), domain = site.slice(10).toLowerCase().replace(/^www\./, ''); return host === domain || host.endsWith(`.${domain}`) ? domain.length : -1; } catch { return -1; }
   }
-  const byPage = new Map();
-  const outcomes = await mapLimit([...groups.entries()], 3, async ([host, group]) => {
-    const targets = [...new Set(group.flatMap(doc => [doc.url, doc.final_url]))];
-    const where = { or: targets.map(target => ({ field: 'url', is: ['eq', target] })) };
-    const params = new URLSearchParams({
-      select: 'url,top_keyword,top_keyword_volume,top_keyword_best_position',
-      // The Site Explorer Top Pages endpoint requires a target alongside filters.
-      // Use the grouped host as the scope, then narrow to the submitted URLs below.
-      target: host,
-      where: JSON.stringify(where),
-      limit: '1000',
-      date,
-      country: 'au',
-      mode: 'subdomains',
-      protocol: 'both',
-      volume_mode: 'average',
-      output: 'json'
+  try {
+    const property = new URL(site), pageValue = new URL(page);
+    if (property.protocol !== pageValue.protocol || property.host.toLowerCase() !== pageValue.host.toLowerCase()) return -1;
+    const prefix = `${property.origin}${property.pathname}`;
+    return page.startsWith(prefix) ? prefix.length : -1;
+  } catch { return -1; }
+}
+function chooseGscProperty(sites, docs) {
+  return sites.map(site => {
+    const siteUrl = site.siteUrl || site.site_url || '';
+    const scores = docs.map(doc => Math.max(gscPropertyScore(siteUrl, doc.final_url), gscPropertyScore(siteUrl, doc.url)));
+    return { siteUrl, score: scores.every(score => score >= 0) ? Math.min(...scores) : -1 };
+  }).filter(site => site.score >= 0).sort((a, b) => b.score - a.score)[0]?.siteUrl || '';
+}
+async function gscRequest(url, token, payload) {
+  const response = await fetch(url, { method: payload ? 'POST' : 'GET', headers: { authorization: `Bearer ${token}`, ...(payload ? { 'content-type': 'application/json' } : {}) }, ...(payload ? { body: JSON.stringify(payload) } : {}), signal: AbortSignal.timeout(45000) });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`Search Console API HTTP ${response.status}: ${String(body.error?.message || '').slice(0, 220)}`);
+  return body;
+}
+async function listGoogleSearchConsoleSites(token) {
+  const body = await gscRequest('https://www.googleapis.com/webmasters/v3/sites', token);
+  return (body.siteEntry || []).filter(site => site.permissionLevel && site.permissionLevel !== 'siteUnverifiedUser');
+}
+async function pageQueryRows(token, property, doc, startDate, endDate) {
+  const pageUrl = gscPropertyScore(property, doc.final_url) >= 0 ? doc.final_url : doc.url;
+  const all = [], rowLimit = 25000;
+  for (let startRow = 0; startRow < 50000; startRow += rowLimit) {
+    const body = await gscRequest(`https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(property)}/searchAnalytics/query`, token, {
+      startDate, endDate, dimensions: ['date', 'query'], type: 'web', rowLimit, startRow,
+      dimensionFilterGroups: [{ groupType: 'and', filters: [{ dimension: 'page', operator: 'equals', expression: pageUrl }] }]
     });
+    const rows = body.rows || []; all.push(...rows);
+    if (rows.length < rowLimit) break;
+  }
+  return { page: doc.url, rows: all };
+}
+function aggregateGscRows(pageRows, startDate, endDate, normalize = normalizePage) {
+  const grouped = new Map();
+  for (const { page, rows } of pageRows) for (const row of rows) {
+    const date = row.keys?.[0], query = String(row.keys?.[1] || '').trim();
+    if (!date || date < startDate || date > endDate || !query) continue;
+    const normalizedPage = normalize(page), key = `${normalizedPage}\n${query.toLowerCase()}`, current = grouped.get(key) || { page: normalizedPage, query, clicks: 0, impressions: 0, weightedPosition: 0 };
+    const impressions = Number(row.impressions || 0);
+    current.clicks += Number(row.clicks || 0); current.impressions += impressions; current.weightedPosition += Number(row.position || 0) * impressions;
+    grouped.set(key, current);
+  }
+  return [...grouped.values()].map(row => ({ ...row, ctr: row.impressions ? row.clicks / row.impressions : 0, position: row.impressions ? row.weightedPosition / row.impressions : 0, weightedPosition: undefined }));
+}
+async function queryOnlyImpressionTotals(token, property, startDate, endDate) {
+  const totals = new Map(), rowLimit = 25000;
+  for (let startRow = 0; startRow < 50000; startRow += rowLimit) {
+    const body = await gscRequest(`https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(property)}/searchAnalytics/query`, token, { startDate, endDate, dimensions: ['query'], type: 'web', rowLimit, startRow });
+    const rows = body.rows || [];
+    for (const row of rows) {
+      const query = String(row.keys?.[0] || '').trim();
+      if (query) totals.set(query.toLowerCase(), Number(row.impressions || 0));
+    }
+    if (rows.length < rowLimit) break;
+  }
+  return totals;
+}
+async function fetchGoogleSearchData(token, docs, startDate, endDate) {
+  const sites = await listGoogleSearchConsoleSites(token), site = chooseGscProperty(sites, docs);
+  if (!site) throw new Error('The signed-in Google account has no Search Console property that covers all submitted URLs. Add it in Search Console or choose URLs from one property.');
+  const halfStart = shiftIsoMonths(endDate, -3), firstEnd = shiftIsoDays(halfStart, -1);
+  const settled = await mapLimit(docs, 4, async doc => {
+    try { return { ok: true, result: await pageQueryRows(token, site, doc, startDate, endDate), doc }; }
+    catch (error) { return { ok: false, message: `${doc.url}: ${error.message}` }; }
+  });
+  const successful = settled.filter(item => item.ok), failures = settled.filter(item => !item.ok);
+  const rows = aggregateGscRows(successful.map(item => item.result), startDate, endDate);
+  const previousRows = aggregateGscRows(successful.map(item => item.result), startDate, firstEnd);
+  const recentRows = aggregateGscRows(successful.map(item => item.result), halfStart, endDate);
+  const cannibalStart = shiftIsoDays(endDate, -27);
+  const cannibalRows = aggregateGscRows(successful.map(item => item.result), cannibalStart, endDate, normalizeCannibalUrl);
+  let queryTotals = new Map(), queryOnlyError = '';
+  try { queryTotals = await queryOnlyImpressionTotals(token, site, cannibalStart, endDate); }
+  catch (error) { queryOnlyError = error.message.slice(0, 220); }
+  return { site, rows, previousRows, recentRows, cannibalRows, queryTotals, queryOnlyError, cannibal_start_date: cannibalStart, cannibal_end_date: endDate, status: failures.length ? (successful.length ? 'partial' : 'unavailable') : (rows.length ? 'available' : 'no-matching-rows'), message: failures.length ? failures.slice(0, 3).map(x => x.message).join(' · ') : rows.length ? 'Google Search Console read-only data retrieved. The top query is selected by impressions; clicks compare the earlier and latest three months.' : 'Search Console returned no query rows for these pages in the selected date range.', start_date: startDate, end_date: endDate, rows_returned: rows.length, property: site };
+}
+function normalizeCannibalUrl(value) {
+  try { const url = new URL(String(value)); const path = url.pathname.replace(/\/+$/, '') || '/'; return `https://${url.host.toLowerCase()}${path}`; }
+  catch { return String(value || '').trim().replace(/^https?:\/\//i, '').replace(/[?#].*$/, '').replace(/\/+$/, ''); }
+}
+function normalizeQuery(value) { return String(value || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim().replace(/\s+/g, ' '); }
+function inferredBrandTerms(property, docs) {
+  let host = String(property || '').replace(/^sc-domain:/, '');
+  if (!host) { try { host = new URL(docs[0]?.final_url || docs[0]?.url).hostname; } catch {} }
+  else if (/^https?:\/\//i.test(host)) { try { host = new URL(host).hostname; } catch {} }
+  host = host.toLowerCase().replace(/^www\./, '');
+  const labels = host.split('.');
+  const twoLevel = new Set(['com.au','net.au','org.au','edu.au','gov.au','asn.au','id.au','co.uk','org.uk','ac.uk','gov.uk','co.nz','org.nz','govt.nz','co.jp','com.sg','com.my','com.hk','com.br','com.mx','com.tr','co.za','com.cn','com.tw','co.in']);
+  const lastTwo = labels.slice(-2).join('.'), root = labels.length >= 3 && twoLevel.has(lastTwo) ? labels.at(-3) : labels.at(-2);
+  const term = normalizeQuery(String(root || '').replace(/[-_]+/g, ' '));
+  return term ? [term] : [];
+}
+function buildCannibalisationReport(rows, queryTotals, nodes, explicitBrandTerms, fallbackQueryTotalError, startDate, endDate) {
+  const brandTerms = explicitBrandTerms.length ? explicitBrandTerms.map(normalizeQuery).filter(Boolean) : inferredBrandTerms(nodes[0]?.url, nodes.map(node => ({ url: node.url })));
+  const filtered = rows.filter(row => row.impressions >= 5 && !brandTerms.some(term => normalizeQuery(row.query).includes(term)));
+  const topByPage = new Map(), pageRows = new Map();
+  for (const row of filtered) {
+    const pageKey = normalizeCannibalUrl(row.page), list = pageRows.get(pageKey) || [];
+    list.push(row); pageRows.set(pageKey, list);
+  }
+  for (const [page, items] of pageRows) topByPage.set(page, [...items].sort((a, b) => b.clicks - a.clicks || b.impressions - a.impressions)[0]?.query || '');
+  const groups = new Map();
+  for (const row of filtered) {
+    const queryKey = row.query.toLowerCase(), page = normalizeCannibalUrl(row.page), key = `${queryKey}\n${page}`;
+    const groupRows = groups.get(queryKey) || new Map();
+    const existing = groupRows.get(page) || { query: row.query, page, clicks: 0, impressions: 0, weightedPosition: 0 };
+    existing.clicks += row.clicks; existing.impressions += row.impressions; existing.weightedPosition += row.position * row.impressions;
+    groupRows.set(page, existing); groups.set(queryKey, groupRows);
+  }
+  const nodeByPage = new Map(nodes.map(node => [normalizeCannibalUrl(node.url), node]));
+  const reportGroups = [];
+  for (const [queryKey, pageMap] of groups) {
+    if (pageMap.size < 2) continue;
+    const items = [...pageMap.values()].map(row => {
+      row.position = row.impressions ? row.weightedPosition / row.impressions : 0;
+      row.ctr = row.impressions ? row.clicks / row.impressions : 0;
+      row.topQuery = topByPage.get(row.page) || '';
+      row.ownsQuery = row.query.toLowerCase() === row.topQuery.toLowerCase();
+      row.node = nodeByPage.get(row.page);
+      return row;
+    }).sort((a, b) => b.impressions - a.impressions);
+    const pageImpressions = items.reduce((sum, row) => sum + row.impressions, 0);
+    const exactQueryTotal = queryTotals.get(queryKey);
+    const queryTotal = Number.isFinite(exactQueryTotal) && exactQueryTotal > 0 ? exactQueryTotal : pageImpressions;
+    const secondShare = items[1].impressions / queryTotal;
+    if (secondShare < 0.1) continue;
+    const leader = items[0], owners = items.filter(row => row.ownsQuery).sort((a, b) => b.clicks - a.clicks || b.impressions - a.impressions);
+    const preferred = owners[0] || leader;
+    const roles = new Set(items.map(row => `${row.node?.expected_role || 'unclear'}|${row.node?.intent || 'unclear'}`));
+    for (const row of items) {
+      const share = row.impressions / queryTotal, ownerUrl = preferred.page, isOwner = row.page === ownerUrl;
+      const rowRole = row.node?.expected_role || 'unclear';
+      const groupRoleNote = roles.size > 1 ? 'The pages have different inferred roles or visitor intents, so query overlap alone does not establish that they should be merged.' : 'The pages have similar inferred roles or visitor intents, so they may be serving the same search need.';
+      row.problem = `“${row.query}” appeared on ${items.length} submitted pages in the last 28 complete days. This page received ${row.impressions} of ${queryTotal} query impressions (${(share * 100).toFixed(1)}%) and ${row.clicks} clicks; ${row.ownsQuery ? 'it is' : 'it is not'} this page’s top query by clicks. ${groupRoleNote}`;
+      row.resolution = isOwner
+        ? `Treat this as the current preferred page for “${row.query}” based on its click-led ownership${row.node?.role_fit ? ` and ${rowRole} role fit (${row.node.role_fit})` : ''}. Keep its query focus clear; distinguish the other pages’ purpose and link to this page where relevant. Consolidate only if page review confirms duplicate intent.`
+        : roles.size > 1
+          ? `Keep this page for its distinct ${rowRole} purpose. Clarify that purpose in its title, H1, and opening copy, and link to the preferred page (${ownerUrl}) for “${row.query}”. Do not merge solely because the query overlaps.`
+          : `Review this page against the preferred page (${ownerUrl}). If both serve the same intent, consolidate or redirect the weaker page after checking its unique value; otherwise differentiate its purpose and link contextually to the preferred page.`;
+      row.share = share; row.queryTotal = queryTotal;
+    }
+    reportGroups.push({ query: items[0].query, queryTotal, items, topShare: items[0].impressions / queryTotal, secondShare });
+  }
+  reportGroups.sort((a, b) => b.queryTotal - a.queryTotal || a.query.localeCompare(b.query));
+  const reportRows = reportGroups.flatMap(group => group.items.map(row => ({ query: row.query, page: row.page, top_query_for_page: row.topQuery, owns_query: row.ownsQuery, clicks: row.clicks, impressions: row.impressions, impression_share: row.share, ctr: row.ctr, avg_position: row.position, query_total_impressions: row.queryTotal, problem: row.problem, resolution: row.resolution })));
+  const mostEven = [...reportGroups].sort((a, b) => Math.abs(a.topShare - a.secondShare) - Math.abs(b.topShare - b.secondShare)).slice(0, 5).map(group => ({ query: group.query, first_page: group.items[0].page, first_share: group.topShare, second_page: group.items[1].page, second_share: group.secondShare }));
+  const fallbackCount = reportGroups.filter(group => !(Number.isFinite(queryTotals.get(group.query.toLowerCase())) && queryTotals.get(group.query.toLowerCase()) > 0)).length;
+  const totalMethod = fallbackCount ? (fallbackCount === reportGroups.length ? 'Query totals use the sum of impressions across the submitted page rows; property-level query-only totals were unavailable.' : `Property-level query-only totals were used when returned; ${fallbackCount} query group(s) use summed submitted-page impressions instead.`) : 'Query totals use the GSC property-level query-only dimension.';
+  return { start_date: startDate, end_date: endDate, brand_terms: brandTerms, min_page_impressions: 5, min_secondary_share: 0.1, query_total_method: fallbackQueryTotalError ? `${totalMethod} Query-only lookup note: ${fallbackQueryTotalError}` : totalMethod, query_total_fallback_groups: fallbackCount, query_count: reportGroups.length, rows: reportRows, most_even: mostEven, status: reportGroups.length ? 'available' : 'no-cannibalisation-found' };
+}
+async function fetchAhrefsVolumes(queries, env) {
+  const unique = [...new Set(queries.map(query => String(query || '').trim()).filter(Boolean))];
+  if (!env.AHREFS_API_KEY) return { status: 'not-configured', byQuery: new Map(), message: 'AHREFS_API_KEY is not configured.' };
+  if (!unique.length) return { status: 'no-gsc-queries', byQuery: new Map(), message: 'No Google Search Console queries were available to look up.' };
+  const byQuery = new Map(), batches = [];
+  for (let i = 0; i < unique.length; i += 100) batches.push(unique.slice(i, i + 100));
+  const outcomes = await mapLimit(batches, 3, async keywords => {
+    const params = new URLSearchParams({ select: 'keyword,volume', keywords: keywords.join(','), country: 'au', output: 'json' });
     try {
-      const response = await fetch(`https://api.ahrefs.com/v3/site-explorer/top-pages?${params}`, { headers: { authorization: `Bearer ${env.AHREFS_API_KEY}`, accept: 'application/json' }, signal: AbortSignal.timeout(45000) });
+      const response = await fetch(`https://api.ahrefs.com/v3/keywords-explorer/overview?${params}`, { headers: { authorization: `Bearer ${env.AHREFS_API_KEY}`, accept: 'application/json' }, signal: AbortSignal.timeout(45000) });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(`Ahrefs API HTTP ${response.status}: ${String(body.error || body.message || '').slice(0, 180)}`);
-      const pages = Array.isArray(body.pages) ? body.pages : Array.isArray(body) ? body : [];
-      for (const page of pages) {
-        const key = normalizeAhrefsPage(page.url || page.raw_url);
-        if (key) byPage.set(key, { keyword: page.top_keyword || '', volume: page.top_keyword_volume == null ? null : number(page.top_keyword_volume), position: page.top_keyword_best_position == null ? null : number(page.top_keyword_best_position), status: page.top_keyword ? 'available' : 'no-keyword' });
+      const records = Array.isArray(body.keywords) ? body.keywords : Array.isArray(body) ? body : [];
+      for (const item of records) {
+        const key = String(item.keyword || '').trim().toLowerCase();
+        if (key) byQuery.set(key, { keyword: item.keyword, volume: item.volume == null ? null : number(item.volume), position: null, status: 'available' });
       }
-      return { status: 'available', host, rows: pages.length };
-    } catch (error) { return { status: 'unavailable', host, message: error.message.slice(0, 240) }; }
+      return { status: 'available' };
+    } catch (error) { return { status: 'unavailable', message: error.message }; }
   });
-  const failed = outcomes.filter(x => x.status === 'unavailable');
-  for (const group of groups.values()) for (const doc of group) {
-    const finalKey = normalizeAhrefsPage(doc.final_url), inputKey = normalizeAhrefsPage(doc.url);
-    const record = byPage.get(finalKey) || byPage.get(inputKey);
-    if (record) { byPage.set(normalizeAhrefsPage(doc.final_url), record); byPage.set(normalizeAhrefsPage(doc.url), record); }
-    else {
-      const host = new URL(doc.final_url).hostname.toLowerCase().replace(/^www\./, '');
-      const outcome = outcomes.find(item => item.host === host);
-      const fallback = outcome?.status === 'unavailable'
-        ? { status: 'unavailable', keyword: '', volume: null, position: null, message: outcome.message }
-        : { status: 'no-keyword', keyword: '', volume: null, position: null, message: 'Ahrefs returned no top keyword for this exact URL.' };
-      byPage.set(finalKey, fallback); byPage.set(inputKey, fallback);
-    }
-  }
-  const unitEstimate = [...groups.values()].reduce((sum, group) => sum + Math.max(50, group.length * 13), 0);
-  return { status: failed.length === outcomes.length ? 'unavailable' : 'available', byPage, message: failed.length ? failed.map(x => `${x.host}: ${x.message}`).join(' · ') : '', groups: outcomes.length, unitEstimate };
+  const failed = outcomes.filter(item => item.status === 'unavailable');
+  return { status: failed.length === outcomes.length ? 'unavailable' : failed.length ? 'partial' : 'available', byQuery, message: failed.map(item => item.message).join(' · '), country: 'AU', lookups: unique.length, unitEstimate: Math.max(50, unique.length * 10) };
 }
 
 function sheetInsights(node, overlapping, page6, previous3, recent3, ahrefs) {
@@ -457,28 +564,19 @@ function components(nodes, links) {
 
 async function handle(request, env) {
   const url = new URL(request.url);
+  if (request.method === 'GET' && url.pathname === '/api/google/auth') return beginGoogleOAuth(request, env);
+  if (request.method === 'GET' && url.pathname === '/api/google/callback') return finishGoogleOAuth(request, env);
   if (url.pathname.startsWith('/api/')) {
     const origin = request.headers.get('origin');
     if (origin && origin !== url.origin) return json({ error: 'Cross-origin request blocked.' }, 403);
-    if (request.method === 'GET' && url.pathname === '/api/config') return json({ google_cloud_project: env.GOOGLE_CLOUD_PROJECT || '', google_cloud_configured: Boolean(env.GOOGLE_SERVICE_ACCOUNT_JSON), seogets_configured: Boolean(env.SEOGETS_API_KEY), ahrefs_configured: Boolean(env.AHREFS_API_KEY), claude_configured: Boolean(env.ANTHROPIC_API_KEY) });
-    if (request.method === 'POST' && url.pathname === '/api/seogets/sites') return listSeoGetsSites(env);
+    if (request.method === 'GET' && url.pathname === '/api/config') return json({ google_cloud_project: env.GOOGLE_CLOUD_PROJECT || '', google_cloud_configured: Boolean(env.GOOGLE_SERVICE_ACCOUNT_JSON), google_oauth_configured: Boolean(env.GOOGLE_OAUTH_CLIENT_ID && env.GOOGLE_OAUTH_CLIENT_SECRET), ahrefs_configured: Boolean(env.AHREFS_API_KEY), claude_configured: Boolean(env.ANTHROPIC_API_KEY) });
+    if (request.method === 'GET' && url.pathname === '/api/google/status') return googleOAuthStatus(request, env);
+    if (request.method === 'POST' && url.pathname === '/api/google/disconnect') return json({ ok: true }, 200, { 'set-cookie': clearCookieHeader(GSC_TOKEN_COOKIE) });
     if (request.method === 'POST' && url.pathname === '/api/analyze') return analyze(request, env);
     if (request.method === 'GET' && url.pathname === '/api/health') return json({ ok: true });
     return json({ error: 'API route not found.' }, 404);
   }
   return env.ASSETS.fetch(request);
-}
-
-async function listSeoGetsSites(env) {
-  if (!env.SEOGETS_API_KEY) return json({ error: 'SEOGETS_API_KEY is not configured in the Worker.' }, 503);
-  try {
-    const { tools, sessionId, protocolVersion } = await openMcp(env.SEOGETS_API_KEY);
-    const list = tools.find(t => t.name === 'list_sites');
-    if (!list) return json({ error: 'SEO Gets did not expose its read-only list_sites tool.' }, 502);
-    const rpc = await mcpRpc(env.SEOGETS_API_KEY, 'tools/call', { name: list.name, arguments: {} }, sessionId, 4, protocolVersion);
-    const performance = tools.find(t => t.name === GSC_TOOL);
-    return json({ sites: decodeToolResult(rpc.result), read_tools: tools.filter(t => !/create|update|delete|write|setup|prioritize|add_|remove_/i.test(t.name)).map(t => t.name), performance_schema: performance?.inputSchema || null });
-  } catch (e) { return json({ error: `Could not connect to SEO Gets: ${e.message}` }, 502); }
 }
 
 async function analyze(request, env) {
@@ -492,11 +590,14 @@ async function analyze(request, env) {
   try { requested = [...new Set(urls.map(u => validUrl(u).href))]; }
   catch (e) { return json({ error: e.message }, 400); }
   if (requested.length < 2) return json({ error: 'Add at least two different URLs.' }, 400);
-  const startDate = String(body.start_date || ''), endDate = String(body.end_date || ''), site = String(body.seogets_site || '').trim();
-  if (!site) return json({ error: 'Select the matching SEO Gets property so search verification can run.' }, 400);
-  if (!env.SEOGETS_API_KEY) return json({ error: 'SEO Gets is not configured in the Worker. Add its API key as SEOGETS_API_KEY.' }, 503);
+  const startDate = String(body.start_date || ''), endDate = String(body.end_date || '');
   if (!env.GOOGLE_SERVICE_ACCOUNT_JSON) return json({ error: 'Google Cloud is not configured in the Worker. Add a service account as GOOGLE_SERVICE_ACCOUNT_JSON.' }, 503);
+  if (!env.GOOGLE_OAUTH_CLIENT_ID || !env.GOOGLE_OAUTH_CLIENT_SECRET) return json({ error: 'Google Search Console sign-in is not fully configured in the Worker.' }, 503);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate) || startDate > endDate) return json({ error: 'Choose a valid Search Console date range.' }, 400);
+
+  let searchToken;
+  try { searchToken = await googleSearchConsoleAccessToken(request, env); }
+  catch (e) { return json({ error: e.message }, 401, { 'set-cookie': clearCookieHeader(GSC_TOKEN_COOKIE) }); }
 
   const errors = [], docs = [];
   await mapLimit(requested, 4, async original => {
@@ -517,28 +618,24 @@ async function analyze(request, env) {
   try { embedded = await vertexEmbeddings(usable, cloudToken, env); }
   catch (e) { return json({ error: e.message.slice(0, 300) }, 502); }
   const vector = vectors(usable);
-  const [intent, entity, ahrefsResult] = await Promise.all([claudeAnalysis(usable, env), entities(usable, cloudToken, env, googleAuthError), fetchAhrefsTopPages(usable, env, endDate)]);
+  let gscResult;
+  try { gscResult = await fetchGoogleSearchData(searchToken, usable, startDate, endDate); }
+  catch (e) { gscResult = { site: '', rows: [], previousRows: [], recentRows: [], status: 'unavailable', message: e.message.slice(0, 300), start_date: startDate, end_date: endDate }; }
+  const rows = gscResult.rows || [], previousRows = gscResult.previousRows || [], recentRows = gscResult.recentRows || [];
+  const gscStatus = { method: 'Google Search Console API (OAuth read-only)', status: gscResult.status, site: gscResult.site, start_date: startDate, end_date: endDate, rows: rows.length, truncated: false, message: gscResult.message };
+  const [intent, entity] = await Promise.all([claudeAnalysis(usable, env), entities(usable, cloudToken, env, googleAuthError)]);
   const nodes = usable.map((d, i) => ({ id: i, url: d.url, title: d.title, type: 'page', chars: d.chars, template_chars_removed: d.template_chars_removed || 0, intent: intent[i].intent, intent_confidence: Number(intent[i].confidence) || 0, intent_evidence: intent[i].evidence || '', intent_source: intent[i].source, expected_role: intent[i].expected_role || 'unclear', expected_role_confidence: Number(intent[i].expected_role_confidence) || 0, expected_role_evidence: intent[i].expected_role_evidence || '', role_source: intent[i].role_source, role_fit: intent[i].role_fit || 'unclear', role_evidence: intent[i].role_evidence || '', depth_score: intent[i].depth_score, closest_entity: entity[i].name, closest_entity_type: entity[i].type, closest_entity_salience: entity[i].salience, entity_method: entity[i].method, text_excerpt: d.text.slice(0, 700) }));
-
-  let rows = [], previousRows = [], recentRows = [], gscStatus = { method: 'SEO Gets MCP', status: 'not-connected', site, start_date: startDate, end_date: endDate, rows: 0, truncated: false, message: 'SEO Gets query data was not available.' };
-  if (site && env.SEOGETS_API_KEY) {
-    try {
-      const { tools, sessionId, protocolVersion } = await openMcp(env.SEOGETS_API_KEY);
-      const tool = tools.find(t => t.name === GSC_TOOL);
-      if (!tool) throw new Error(`SEO Gets does not expose the read-only ${GSC_TOOL} tool.`);
-      const halfStart = shiftIsoMonths(endDate, -3), firstEnd = shiftIsoDays(halfStart, -1);
-      rows = await seoPerformanceRows(env.SEOGETS_API_KEY, tool, site, startDate, endDate, sessionId, protocolVersion, usable, 4);
-      previousRows = await seoPerformanceRows(env.SEOGETS_API_KEY, tool, site, startDate, firstEnd, sessionId, protocolVersion, usable, 5);
-      recentRows = await seoPerformanceRows(env.SEOGETS_API_KEY, tool, site, halfStart, endDate, sessionId, protocolVersion, usable, 6);
-      gscStatus = { method: 'SEO Gets MCP / get_site_performance', status: rows.length ? 'available' : 'no-matching-rows', site, start_date: startDate, end_date: endDate, rows: rows.length, truncated: rows.length >= 50000, message: rows.length ? 'Six-month page/query performance retrieved. Shared queries flag possible cannibalisation; clicks compare the first and latest three months for decay signals.' : 'SEO Gets returned no page/query rows matching the input URLs. Check the property, date range, and canonical URLs.' };
-    } catch (e) { gscStatus = { ...gscStatus, status: 'unavailable', message: e.message.slice(0, 300) }; }
-  } else if (site) {
-    gscStatus = { ...gscStatus, status: 'unavailable', message: 'SEOGETS_API_KEY is not configured in the Worker.' };
+  const explicitBrandTerms = Array.isArray(body.brand_terms) ? body.brand_terms.map(term => String(term).trim()).filter(Boolean) : [];
+  const cannibalReport = buildCannibalisationReport(gscResult.cannibalRows || [], gscResult.queryTotals || new Map(), nodes, explicitBrandTerms, gscResult.queryOnlyError || '', gscResult.cannibal_start_date || shiftIsoDays(endDate, -27), gscResult.cannibal_end_date || endDate);
+  for (const node of nodes) {
+    const pageRows = rows.filter(r => r.page === normalizePage(node.url));
+    node.gsc_top_query = [...pageRows].sort((a, b) => b.impressions - a.impressions || b.clicks - a.clicks)[0]?.query || '';
   }
-
+  const ahrefsResult = await fetchAhrefsVolumes(nodes.map(node => node.gsc_top_query), env);
   for (const node of nodes) {
     const pageRows = rows.filter(r => r.page === normalizePage(node.url));
     node.search_console = rows.length ? { query_count: pageRows.length, clicks: pageRows.reduce((n, x) => n + x.clicks, 0), impressions: pageRows.reduce((n, x) => n + x.impressions, 0), top_queries: [...pageRows].sort((a, b) => b.impressions - a.impressions).slice(0, 3).map(x => ({ query: x.query, impressions: x.impressions, clicks: x.clicks, position: x.position })) } : null;
+    node.ahrefs_volume = ahrefsResult.byQuery.get(node.gsc_top_query.toLowerCase()) || { status: node.gsc_top_query ? (ahrefsResult.status === 'available' ? 'no-volume' : ahrefsResult.status) : 'no-gsc-query', keyword: node.gsc_top_query, volume: null, position: null, message: node.gsc_top_query ? (ahrefsResult.message || 'Ahrefs returned no volume for this query.') : 'No GSC query was available to look up.' };
   }
   const links = [], searchOverlaps = [];
   for (let i = 0; i < usable.length; i++) for (let j = i + 1; j < usable.length; j++) {
@@ -557,13 +654,22 @@ async function analyze(request, env) {
       const other = nodes.find(candidate => candidate.id === otherId);
       return { other_title: other?.title || other?.url || 'Other page', other_url: other?.url || '', metrics: { shared_query_count: pair.shared_query_count, shared_impressions: pair.shared_impressions, shared_clicks: pair.shared_clicks, shared_queries: pair.shared_queries } };
     });
-    node.workbook = sheetInsights(node, pairRows, summarizePagePerformance(rows, usable[node.id]), summarizePagePerformance(previousRows, usable[node.id]), summarizePagePerformance(recentRows, usable[node.id]), ahrefsResult.byPage.get(normalizeAhrefsPage(node.url)) || { status: ahrefsResult.status, keyword: '', volume: null, position: null, message: ahrefsResult.message });
+    node.workbook = sheetInsights(node, pairRows, summarizePagePerformance(rows, usable[node.id]), summarizePagePerformance(previousRows, usable[node.id]), summarizePagePerformance(recentRows, usable[node.id]), node.ahrefs_volume);
+    const pageCannibalRows = cannibalReport.rows.filter(row => normalizeCannibalUrl(row.page) === normalizeCannibalUrl(node.url));
+    if (pageCannibalRows.length) {
+      const strongest = [...pageCannibalRows].sort((a, b) => b.query_total_impressions - a.query_total_impressions || b.impressions - a.impressions)[0];
+      const queryNames = [...new Set(pageCannibalRows.map(row => row.query))];
+      node.workbook.issue_tags = [node.workbook.issue_tags === 'None detected' ? '' : node.workbook.issue_tags, `Cannibalisation (${queryNames.slice(0, 3).join(', ')})`].filter(Boolean).join(', ');
+      node.workbook.problem = `${node.workbook.problem} ${strongest.problem}`.trim();
+      node.workbook.optimisation_needed = node.workbook.optimisation_needed === 'No' ? 'Yes – Medium' : node.workbook.optimisation_needed;
+      node.workbook.recommended_action = [node.workbook.recommended_action, ...new Set(pageCannibalRows.map(row => row.resolution))].filter(Boolean).join(' ');
+    }
   }
   const groups = components(nodes, links);
   for (let i = 0; i < groups.length; i++) for (const id of groups[i]) { nodes[id].cluster = i + 1; nodes[id].cluster_name = keywords(vector[groups[i][0]], vector[groups[i].at(-1)], 3).join(', ') || 'Related pages'; }
   for (const n of nodes) { n.cluster ||= 0; n.cluster_name ||= 'No detected overlap'; }
   const intents = [...new Set(intent.map(x => x.source))];
-  return json({ result: { nodes, links, search_overlaps: searchOverlaps, errors, threshold, similarity_method: embedded ? 'Vertex AI text embeddings' : 'Local TF-IDF text similarity', cleanup_method: 'Main-content extraction, DOM chrome removal, and repeated same-site block removal', intent_method: intents.length === 1 ? intents[0] : 'Claude + local fallback', entity_method: [...new Set(entity.map(x => x.method))].join('; '), clusters: groups.map((g, i) => ({ id: i + 1, size: g.length })), created_at: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC', search_evidence: gscStatus, ahrefs_evidence: { status: ahrefsResult.status, message: ahrefsResult.message, country: 'AU', date: endDate, groups: ahrefsResult.groups || 0 }, ahrefs_unit_estimate: ahrefsResult.unitEstimate, report_method: { gsc_window: 'Six months, compared as earlier three months vs latest three months', decay_threshold: 'Click decline of 20% or more is tagged for review; this is a triage signal, not proof of cause.', cannibalisation_method: 'At least one query appears for two or more submitted pages in the six-month GSC data.', ahrefs_method: 'Top Pages report, exact submitted URL filter, Australian database, average volume mode.' } } });
+  return json({ result: { nodes, links, search_overlaps: searchOverlaps, cannibalisation_report: cannibalReport, errors, threshold, similarity_method: embedded ? 'Vertex AI text embeddings' : 'Local TF-IDF text similarity', cleanup_method: 'Main-content extraction, DOM chrome removal, and repeated same-site block removal', intent_method: intents.length === 1 ? intents[0] : 'Claude + local fallback', entity_method: [...new Set(entity.map(x => x.method))].join('; '), clusters: groups.map((g, i) => ({ id: i + 1, size: g.length })), created_at: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC', search_evidence: gscStatus, ahrefs_evidence: { status: ahrefsResult.status, message: ahrefsResult.message, country: ahrefsResult.country || 'AU', date: endDate, lookups: ahrefsResult.lookups || 0 }, ahrefs_unit_estimate: ahrefsResult.unitEstimate, report_method: { gsc_window: 'Six months, compared as earlier three months vs latest three months', cannibalisation_window: 'Last 28 complete days', decay_threshold: 'Click decline of 20% or more is tagged for review; this is a triage signal, not proof of cause.', cannibalisation_method: 'At least two submitted pages with 5+ impressions each; the second-highest page must contribute at least 10% of the GSC query total. Brand queries are excluded.', ahrefs_method: 'Keywords Explorer Overview lookup for each page’s highest-impression Google Search Console query; Australian keyword volume.' } } });
 }
 
 export default { fetch: handle };

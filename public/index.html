@@ -36,7 +36,12 @@
       <div class="threshold-control"><label for="threshold">Show matches from <strong><span id="threshold-value">85</span>%</strong></label><input id="threshold" type="range" min="10" max="90" value="85"><div class="range-labels"><span>More connections</span><span>Stronger matches</span></div></div>
         <button id="analyze" class="primary-button" type="button"><span>Build my graph</span><span class="button-arrow">→</span></button>
       </div>
-      <p class="privacy-note">Pages are fetched for analysis. Claude reads the extracted page text and URL slug. Google Cloud and six-month SEO Gets data run automatically; Ahrefs keyword data is added when configured. Download the graph or an Excel report.</p>
+      <div class="brand-filter"><label for="brand-terms">Brand terms to exclude <span>optional</span></label><input id="brand-terms" type="text" placeholder="Leave blank to infer from the site domain"><small>Separate multiple terms with commas. The cannibalisation report uses the last 28 complete days.</small></div>
+      <div class="gsc-connect-panel">
+        <div class="gsc-connect-copy"><div><strong>Google Search Console</strong><span id="gsc-status" class="gsc-status">Checking connection…</span></div><p>Connect an account with access to these sites. The app requests read-only search data.</p><label class="remember-option"><input id="gsc-remember" type="checkbox"><span>Remember this device for 30 days</span></label></div>
+        <div class="gsc-connect-actions"><a id="gsc-connect" class="secondary-button" href="/api/google/auth?remember=0">Connect Google</a><button id="gsc-disconnect" class="text-button hidden" type="button">Disconnect</button></div>
+      </div>
+      <p class="privacy-note">Pages are fetched for analysis. Google Search Console supplies page queries; Ahrefs supplies Australian search volume for each page’s highest-impression query. Download the graph or an Excel report.</p>
     </section>
 
     <section class="progress-card hidden" id="progress-card" aria-live="polite">

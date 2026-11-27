@@ -1,3 +1,5 @@
 # Copy to .dev.vars for local Wrangler development; never commit .dev.vars.
-SEOGETS_API_KEY=paste-your-seogets-mcp-key-here
 ANTHROPIC_API_KEY=paste-your-anthropic-key-here
+AHREFS_API_KEY=paste-your-ahrefs-api-key-here
+GOOGLE_OAUTH_CLIENT_ID=your-google-oauth-web-client-id
+GOOGLE_OAUTH_CLIENT_SECRET=your-google-oauth-web-client-secret
